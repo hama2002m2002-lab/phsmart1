@@ -1,0 +1,26 @@
+{
+  "short_name": "7amo.pos",
+  "name": "7amo.pos - Offline POS & Inventory System",
+  "id": "/",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#0B1120",
+  "theme_color": "#0B1120",
+  "description": "برنامج 7amo.pos لإدارة الكاشير والمبيعات والمخزون أوفلاين بدون إنترنت كـ تطبيق سطح مكتب",
+  "icons": [
+    {
+      "src": "/pwa-icon.svg",
+      "type": "image/svg+xml",
+      "sizes": "any",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/pwa-icon.svg",
+      "type": "image/svg+xml",
+      "sizes": "192x192 512x512",
+      "purpose": "any"
+    }
+  ]
+}

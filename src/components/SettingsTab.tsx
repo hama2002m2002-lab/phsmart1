@@ -1,0 +1,1700 @@
+import React, { useState, useRef, useEffect } from 'react';
+import { Settings as SettingsIcon, Store, Globe, DollarSign, Percent, Save, CheckCircle2, Database, Download, Upload, RefreshCw, Keyboard, FileText, Wifi, Moon, Sun, Zap, FileSpreadsheet, ShieldCheck, Printer, Laptop, Trash2, AlertTriangle, Lock, Cloud, Sparkles, Key, Eye, EyeOff, ExternalLink, Cpu, Clock, Calendar, History, Shield, Check, AlertCircle, HardDrive } from 'lucide-react';
+import { StoreSettings, Product, SaleTransaction, Supplier, Customer, MarketOrder, MarketNotification, PurchaseInvoice, UserAccount, AutoBackupSnapshot } from '../types';
+import {
+  createFullSystemBackup,
+  getStoredBackupSnapshots,
+  restoreBackupSnapshot,
+  deleteBackupSnapshot,
+  downloadBackupSnapshot,
+  clearAllBackupSnapshots,
+  getTimeRemainingUntilNextBackup,
+  formatBackupDateTime
+} from '../lib/autoBackupManager';
+import { KeyboardShortcutsModal } from './KeyboardShortcutsModal';
+import { DatabaseStorageModal } from './DatabaseStorageModal';
+import { StressTestDataModal } from './StressTestDataModal';
+import { KioskPrintModal } from './KioskPrintModal';
+import { GoogleDriveBackupModal } from './GoogleDriveBackupModal';
+import { downloadKioskPrintingBatchFile, print80mmCashierReceipt } from '../lib/thermalPrinter';
+import { getTranslation } from '../lib/translations';
+import { exportStoreToExcel, exportProductsToExcel, parseExcelBackupFile } from '../lib/excelExport';
+import { syncBulkWriteCollection } from '../lib/firestoreSync';
+
+interface SettingsTabProps {
+  settings: StoreSettings;
+  setSettings: React.Dispatch<React.SetStateAction<StoreSettings>>;
+  userAccounts?: UserAccount[];
+  setUserAccounts?: React.Dispatch<React.SetStateAction<UserAccount[]>>;
+  products?: Product[];
+  salesHistory?: SaleTransaction[];
+  suppliers?: Supplier[];
+  customers?: Customer[];
+  orders?: MarketOrder[];
+  notifications?: MarketNotification[];
+  purchaseInvoices?: PurchaseInvoice[];
+  onImportBackup?: (backupData: any) => number | void;
+  onFactoryReset?: () => Promise<void> | void;
+  onlyPermissionsAndAccounts?: boolean;
+  initialSubTab?: 'general';
+}
+
+export const SettingsTab: React.FC<SettingsTabProps> = ({ 
+  settings, 
+  setSettings,
+  userAccounts = [],
+  setUserAccounts,
+  products,
+  salesHistory,
+  suppliers,
+  customers,
+  orders,
+  notifications,
+  purchaseInvoices,
+  onImportBackup,
+  onFactoryReset
+}) => {
+  const isAr = settings.language === 'ar';
+  const isKu = settings.language === 'ku';
+
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [importStatus, setImportStatus] = useState<string>('');
+  const [isSavedMessage, setIsSavedMessage] = useState<string>('');
+
+  // POS Keyboard Shortcuts Modal State
+  const [isShortcutsModalOpen, setIsShortcutsModalOpen] = useState(false);
+  const [isDbStorageModalOpen, setIsDbStorageModalOpen] = useState(false);
+  const [isStressTestModalOpen, setIsStressTestModalOpen] = useState(false);
+  const [isKioskModalOpen, setIsKioskModalOpen] = useState(false);
+  const [isGoogleDriveModalOpen, setIsGoogleDriveModalOpen] = useState(false);
+  const [isResetConfirmOpen, setIsResetConfirmOpen] = useState(false);
+  const [isResetting, setIsResetting] = useState(false);
+
+  // Auto-backup states
+  const [backupSnapshots, setBackupSnapshots] = useState<AutoBackupSnapshot[]>([]);
+  const [isLoadingSnapshots, setIsLoadingSnapshots] = useState(false);
+  const [isTakingBackup, setIsTakingBackup] = useState(false);
+  const [backupNotice, setBackupNotice] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+  const [snapshotToRestore, setSnapshotToRestore] = useState<AutoBackupSnapshot | null>(null);
+  const [isRestoringSnapshot, setIsRestoringSnapshot] = useState(false);
+
+  const loadSnapshots = async () => {
+    setIsLoadingSnapshots(true);
+    try {
+      const list = await getStoredBackupSnapshots();
+      setBackupSnapshots(list);
+    } catch (err) {
+      console.warn('Error loading backup snapshots:', err);
+    } finally {
+      setIsLoadingSnapshots(false);
+    }
+  };
+
+  useEffect(() => {
+    loadSnapshots();
+
+    const handleBackupEvent = () => {
+      loadSnapshots();
+    };
+
+    window.addEventListener('pos_backup_created', handleBackupEvent);
+    return () => window.removeEventListener('pos_backup_created', handleBackupEvent);
+  }, []);
+
+  const handleBackupNow = async () => {
+    setIsTakingBackup(true);
+    try {
+      const download = settings.autoBackupDestination === 'auto_download' || settings.autoBackupDestination === 'both';
+      const snap = await createFullSystemBackup('manual', download);
+      setSettings(prev => ({
+        ...prev,
+        lastAutoBackupTime: snap.timestamp
+      }));
+      await loadSnapshots();
+      setBackupNotice({
+        type: 'success',
+        text: isKu
+          ? `✅ کۆپیکردنی یەدەگ بە سەرکەوتوویی تەواو بوو (${snap.itemsCount.products} کاڵا، ${snap.itemsCount.sales} فرۆشتن)`
+          : isAr
+          ? `✅ تم إنشاء وحفظ نسخة احتياطية كاملة بنجاح (${snap.itemsCount.products} مادة، ${snap.itemsCount.sales} عملية بيع، ${snap.itemsCount.purchases} فاتورة شراء)!`
+          : `✅ Complete backup created (${snap.itemsCount.products} products, ${snap.itemsCount.sales} sales)!`
+      });
+      setTimeout(() => setBackupNotice(null), 6000);
+    } catch (err: any) {
+      setBackupNotice({
+        type: 'error',
+        text: isAr ? `فشل النسخ الاحتياطي: ${err.message}` : `Backup failed: ${err.message}`
+      });
+    } finally {
+      setIsTakingBackup(false);
+    }
+  };
+
+  const handleConfirmRestoreSnapshot = async (snap: AutoBackupSnapshot) => {
+    if (!snap) return;
+    setIsRestoringSnapshot(true);
+    try {
+      const res = await restoreBackupSnapshot(snap.id, (data) => {
+        if (onImportBackup) {
+          onImportBackup(data);
+        }
+      });
+      if (res.success) {
+        setBackupNotice({
+          type: 'success',
+          text: isKu
+            ? `✅ داتاکانی ئەم کۆپییە بە سەرکەوتوویی گەڕێنرانەوە!`
+            : isAr
+            ? `✅ تم استعادة كافة بيانات هذه النسخة الاحتياطية (${snap.formattedDate}) بنجاح!`
+            : `✅ Snapshot restored successfully!`
+        });
+        setSnapshotToRestore(null);
+        setTimeout(() => setBackupNotice(null), 6000);
+      } else {
+        alert(res.message);
+      }
+    } catch (err: any) {
+      alert(err.message || 'Error restoring snapshot');
+    } finally {
+      setIsRestoringSnapshot(false);
+    }
+  };
+
+  const handleDeleteSnapshotItem = async (snapId: string) => {
+    const ok = window.confirm(
+      isKu ? 'دڵنیایت لە سڕینەوەی ئەم کۆپییە لە ئەرشیف؟' : isAr ? 'هل أنت متأكد من حذف هذه النسخة الاحتياطية من الأرشيف؟' : 'Delete this backup from archive?'
+    );
+    if (!ok) return;
+    await deleteBackupSnapshot(snapId);
+    await loadSnapshots();
+  };
+
+  // Google Gemini AI Key State
+  const [showApiKey, setShowApiKey] = useState(false);
+  const [testStatus, setTestStatus] = useState<{
+    loading: boolean;
+    success?: boolean;
+    message?: string;
+    model?: string;
+  }>({ loading: false });
+
+  const handleTestGeminiKey = async () => {
+    setTestStatus({ loading: true });
+    try {
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json'
+      };
+      if (settings.geminiApiKey) {
+        headers['x-gemini-api-key'] = settings.geminiApiKey;
+      }
+      const res = await fetch('/api/gemini/test-key', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ apiKey: settings.geminiApiKey || undefined })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.success) {
+        setTestStatus({
+          loading: false,
+          success: true,
+          model: data.model,
+          message: data.message || (isKu ? 'پەیوەندی بە سەرکەوتوویی ئەنجامدرا!' : isAr ? 'تم التحقق بنجاح! الذكاء الاصطناعي متصل وجاهز للعمل.' : 'Connected successfully!')
+        });
+      } else {
+        setTestStatus({
+          loading: false,
+          success: false,
+          message: data.error || (isKu ? 'نەتوانرا پەیوەندی بە Gemini بکرێت. کلیلی خۆت بپشکنە.' : isAr ? 'تعذر الاتصال بخوادم Gemini. تأكد من صحة المفتاح.' : 'Connection to Gemini failed.')
+        });
+      }
+    } catch (err: any) {
+      setTestStatus({
+        loading: false,
+        success: false,
+        message: err.message || (isKu ? 'هەڵە لە پەیوەندی کردن بە سێرڤەر.' : isAr ? 'حدث خطأ أثناء فحص المفتاح.' : 'Error checking key.')
+      });
+    }
+  };
+
+  const handleChange = (field: keyof StoreSettings, value: any) => {
+    setSettings(prev => ({ ...prev, [field]: value }));
+  };
+
+  const handleManualSave = () => {
+    localStorage.setItem('supermarket_settings_v3', JSON.stringify(settings));
+    setIsSavedMessage(isKu ? 'ڕێکخستنەکان بە سەرکەوتوویی پاشەکەوت کران!' : isAr ? 'تم حفظ كافة الإعدادات بنجاح!' : 'Settings saved successfully!');
+    setTimeout(() => setIsSavedMessage(''), 3500);
+  };
+
+  return (
+    <div className="space-y-6 animate-fadeIn">
+      
+      {/* Header */}
+      <div className="bg-[#10192D] p-5 rounded-3xl border border-blue-500/20 flex flex-wrap items-center justify-between gap-4">
+        <div>
+          <h2 className="text-lg font-bold text-white flex items-center gap-2">
+            <SettingsIcon className="w-5 h-5 text-cyan-400" />
+            {isKu ? 'ڕێکخستنەکانی گشتی و زانیاری فرۆشگە' : isAr ? 'الإعدادات العامة وبيانات المتجر' : 'General Store Settings'}
+          </h2>
+          <p className="text-xs text-slate-400 mt-0.5">
+            {isKu 
+              ? 'ڕێکخستنی زانیارییەکانی باجی پسوولە، دراو، زمان، ڕووکاری سیستم و باکئەپی داتاکان' 
+              : isAr 
+              ? 'تخصيص بيانات الفواتير الضريبية، العملة، اللغة، مظهر النظام والنسخ الاحتياطي' 
+              : 'Configure VAT tax rates, currency, language, system theme, and full backups'}
+          </p>
+        </div>
+
+        {/* ACTION BUTTONS: KEYBOARD SHORTCUTS & SAVE SETTINGS */}
+        <div className="flex flex-wrap items-center gap-3">
+          <button
+            onClick={() => setIsShortcutsModalOpen(true)}
+            className="flex items-center gap-2 px-4 py-3 rounded-2xl bg-gradient-to-r from-cyan-600 via-blue-600 to-indigo-600 text-white text-xs font-black shadow-[0_0_20px_rgba(6,182,212,0.3)] hover:brightness-110 active:scale-95 transition-all cursor-pointer border border-cyan-400/30"
+          >
+            <Keyboard className="w-4 h-4 text-cyan-300" />
+            <span>{isKu ? '⌨️ کورتەبڕەکانی تەختەکلیل (Hotkeys)' : isAr ? '⌨️ اختصارات لوحة المفاتيح' : '⌨️ POS Keyboard Shortcuts'}</span>
+          </button>
+
+          <button
+            onClick={handleManualSave}
+            className="flex items-center gap-2 px-5 py-3 rounded-2xl bg-gradient-to-r from-emerald-500 via-teal-500 to-cyan-600 text-white text-xs font-black shadow-[0_0_20px_rgba(16,185,129,0.3)] hover:brightness-110 active:scale-95 transition-all cursor-pointer"
+          >
+            <Save className="w-4 h-4" />
+            <span>{isKu ? 'پاشەکەوتکردنی ڕێکخستنەکان' : isAr ? 'حفظ التغييرات' : 'Save Settings'}</span>
+          </button>
+        </div>
+      </div>
+
+      {isSavedMessage && (
+        <div className="p-3.5 rounded-2xl bg-emerald-950/80 border border-emerald-500/50 text-emerald-300 text-xs text-center font-bold animate-bounce flex items-center justify-center gap-2">
+          <CheckCircle2 className="w-4 h-4" />
+          <span>{isSavedMessage}</span>
+        </div>
+      )}
+
+      {/* RENDER KEYBOARD SHORTCUTS CONFIGURATION MODAL */}
+      <KeyboardShortcutsModal
+        isOpen={isShortcutsModalOpen}
+        onClose={() => setIsShortcutsModalOpen(false)}
+        settings={settings}
+        setSettings={setSettings}
+      />
+
+      {/* STORE SETTINGS CONFIGURATION */}
+      <div className="cyber-card p-6 rounded-3xl border border-blue-500/20 space-y-6 max-w-4xl">
+
+        {/* POS Keyboard Shortcuts Quick Control Banner */}
+        <div className="p-4 rounded-2xl bg-gradient-to-r from-cyan-950/60 via-blue-950/50 to-indigo-950/60 border border-cyan-500/30 flex flex-wrap items-center justify-between gap-3 shadow-lg">
+          <div className="flex items-center gap-3">
+            <div className="p-3 rounded-xl bg-cyan-500/20 text-cyan-300 border border-cyan-400/40">
+              <Keyboard className="w-5 h-5 animate-pulse" />
+            </div>
+            <div>
+              <h4 className="text-xs font-black text-white">
+                {isKu ? 'کورتەبڕەکانی تەختەکلیل بۆ پەڕەی فرۆشتن (POS Hotkeys)' : isAr ? 'اختصارات الكيبورد لواجهة البيع (POS Hotkeys)' : 'POS Keyboard Hotkeys'}
+              </h4>
+              <p className="text-[11px] text-slate-400 mt-0.5">
+                {isKu ? 'تایبەتکردنی کلیلەکانی وەک F1، F2، F3، F4 بۆ تەواوکردنی پارەدان، کردنەوەی پەنجەرەی نوێ و خوێندنەوەی خێرای بارکۆد' : isAr ? 'تخصيص المفاتيح مثل F1، F2، F3، F4 لإتمام الدفع، فتح نافذة جديدة، ومسح الباركود بسرعة' : 'Customize hotkeys for fast checkout, new window, and barcode scan focus'}
+              </p>
+            </div>
+          </div>
+
+          <button
+            type="button"
+            onClick={() => setIsShortcutsModalOpen(true)}
+            className="px-4 py-2 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-black text-xs shadow-[0_0_15px_rgba(6,182,212,0.4)] transition-all cursor-pointer flex items-center gap-1.5"
+          >
+            <Keyboard className="w-4 h-4" />
+            <span>{isKu ? 'کۆنتڕۆڵ و تایبەتکردن' : isAr ? 'التحكم والتخصيص' : 'Customize Hotkeys'}</span>
+          </button>
+        </div>
+        
+        {/* Language & Regional Settings */}
+        <div className="space-y-4">
+          <div className="border-b border-slate-800 pb-2 flex flex-wrap items-center justify-between gap-2">
+            <h3 className="text-sm font-bold text-cyan-400 flex items-center gap-2">
+              <Globe className="w-4 h-4 text-cyan-400" />
+              <span>{getTranslation(settings.language, 'languageSelectLabel')}</span>
+            </h3>
+            <span className="text-[10px] text-cyan-300/80 bg-cyan-950/60 border border-cyan-500/30 px-2 py-0.5 rounded-full font-mono">
+              {isKu ? '🔒 تایبەت بەم ئامێرە' : isAr ? '🔒 مستقل وخاص بهذا الجهاز فقط' : '🔒 Device-specific setting'}
+            </span>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            <button
+              type="button"
+              onClick={() => handleChange('language', 'ar')}
+              className={`p-3 rounded-2xl border text-xs font-bold transition-all flex items-center justify-between cursor-pointer ${
+                settings.language === 'ar'
+                  ? 'bg-gradient-to-r from-blue-600 to-cyan-600 text-white border-cyan-400 shadow-[0_0_15px_rgba(6,182,212,0.3)]'
+                  : 'bg-[#0B1120] text-slate-300 border-slate-800 hover:border-slate-700'
+              }`}
+            >
+              <span className="flex items-center gap-2">
+                <span>🇸🇦</span>
+                <span>العربية</span>
+              </span>
+              {settings.language === 'ar' && <CheckCircle2 className="w-4 h-4 text-cyan-200" />}
+            </button>
+
+            <button
+              type="button"
+              onClick={() => handleChange('language', 'en')}
+              className={`p-3 rounded-2xl border text-xs font-bold transition-all flex items-center justify-between cursor-pointer ${
+                settings.language === 'en'
+                  ? 'bg-gradient-to-r from-blue-600 to-cyan-600 text-white border-cyan-400 shadow-[0_0_15px_rgba(6,182,212,0.3)]'
+                  : 'bg-[#0B1120] text-slate-300 border-slate-800 hover:border-slate-700'
+              }`}
+            >
+              <span className="flex items-center gap-2">
+                <span>🇬🇧</span>
+                <span>English</span>
+              </span>
+              {settings.language === 'en' && <CheckCircle2 className="w-4 h-4 text-cyan-200" />}
+            </button>
+
+            <button
+              type="button"
+              onClick={() => handleChange('language', 'ku')}
+              className={`p-3 rounded-2xl border text-xs font-bold transition-all flex items-center justify-between cursor-pointer ${
+                settings.language === 'ku'
+                  ? 'bg-gradient-to-r from-blue-600 to-cyan-600 text-white border-cyan-400 shadow-[0_0_15px_rgba(6,182,212,0.3)]'
+                  : 'bg-[#0B1120] text-slate-300 border-slate-800 hover:border-slate-700'
+              }`}
+            >
+              <span className="flex items-center gap-2">
+                <span>☀️</span>
+                <span>کوردی (Kurdish)</span>
+              </span>
+              {settings.language === 'ku' && <CheckCircle2 className="w-4 h-4 text-cyan-200" />}
+            </button>
+          </div>
+        </div>
+
+        {/* System Theme & Night Mode Settings */}
+        <div className="space-y-4 pt-4 border-t border-slate-800">
+          <div className="border-b border-slate-800 pb-2 flex flex-wrap items-center justify-between gap-2">
+            <h3 className="text-sm font-bold text-cyan-400 flex items-center gap-2">
+              <Moon className="w-4 h-4 text-cyan-400" />
+              <span>{getTranslation(settings.language, 'themeModeLabel')}</span>
+            </h3>
+            <span className="text-[10px] text-cyan-300/80 bg-cyan-950/60 border border-cyan-500/30 px-2 py-0.5 rounded-full font-mono">
+              {isKu ? '🔒 تایبەت بەم ئامێرە' : isAr ? '🔒 مستقل وخاص بهذا الجهاز فقط' : '🔒 Device-specific setting'}
+            </span>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <button
+              type="button"
+              onClick={() => handleChange('themeMode', 'dark')}
+              className={`p-3.5 rounded-2xl border text-xs font-bold transition-all flex items-center justify-between cursor-pointer ${
+                settings.themeMode !== 'light'
+                  ? 'bg-gradient-to-r from-indigo-900 via-blue-900 to-cyan-900 text-white border-cyan-400 shadow-[0_0_20px_rgba(6,182,212,0.35)] ring-2 ring-cyan-500/30'
+                  : 'bg-[#0B1120] text-slate-300 border-slate-800 hover:border-slate-700'
+              }`}
+            >
+              <div className="flex items-center gap-2.5">
+                <div className="p-2 rounded-xl bg-cyan-950 text-cyan-300 border border-cyan-500/40">
+                  <Moon className="w-4 h-4 text-cyan-300" />
+                </div>
+                <div className="text-right rtl:text-right ltr:text-left">
+                  <span className="block text-xs font-black">{getTranslation(settings.language, 'darkMode')}</span>
+                  <span className="text-[10px] text-slate-400 font-normal">
+                    {isKu ? 'ڕووکاری تاریک بۆ پاراستنی چاو و گونجاو بۆ کاری شەوانە' : isAr ? 'مظهر داكن مريح للعينين ومناسب لبيئة الماركيت والليلي' : 'Dark high-contrast theme for comfortable usage'}
+                  </span>
+                </div>
+              </div>
+              {settings.themeMode !== 'light' && <CheckCircle2 className="w-4 h-4 text-cyan-300" />}
+            </button>
+
+            <button
+              type="button"
+              onClick={() => handleChange('themeMode', 'light')}
+              className={`p-3.5 rounded-2xl border text-xs font-bold transition-all flex items-center justify-between cursor-pointer ${
+                settings.themeMode === 'light'
+                  ? 'bg-gradient-to-r from-amber-500 to-orange-500 text-white border-amber-300 shadow-[0_0_20px_rgba(245,158,11,0.35)] ring-2 ring-amber-400/40'
+                  : 'bg-[#0B1120] text-slate-300 border-slate-800 hover:border-slate-700'
+              }`}
+            >
+              <div className="flex items-center gap-2.5">
+                <div className="p-2 rounded-xl bg-amber-950 text-amber-300 border border-amber-500/40">
+                  <Sun className="w-4 h-4 text-amber-300" />
+                </div>
+                <div className="text-right rtl:text-right ltr:text-left">
+                  <span className="block text-xs font-black">{getTranslation(settings.language, 'lightMode')}</span>
+                  <span className="text-[10px] text-slate-400 font-normal">
+                    {isKu ? 'ڕووکاری ڕووناک و زۆر دیار بۆ شوێنە ڕووناکەکان' : isAr ? 'مظهر ناصع عالي الوضوح للبيئات المضاءة نهاراً' : 'Clean bright high-visibility theme'}
+                  </span>
+                </div>
+              </div>
+              {settings.themeMode === 'light' && <CheckCircle2 className="w-4 h-4 text-white" />}
+            </button>
+          </div>
+        </div>
+
+        {/* Store Profile Information */}
+        <div className="space-y-4 pt-4 border-t border-slate-800">
+          <h3 className="text-sm font-bold text-cyan-400 border-b border-slate-800 pb-2 flex items-center gap-2">
+            <Store className="w-4 h-4 text-cyan-400" />
+            {isKu ? 'زانیارییە سەرەکییەکانی فرۆشگە و پەڕگەی بازرگانی' : isAr ? 'المعلومات الأساسية للمتجر والسجل التجاري' : 'Store Information'}
+          </h3>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
+            <div>
+              <label className="text-slate-400 mb-1 block">{isKu ? 'ناوی فەرمی فرۆشگە / سوپەرمارکێت' : isAr ? 'اسم المتجر / السوبرماركت' : 'Store Name'}</label>
+              <input
+                type="text"
+                value={settings.storeName}
+                onChange={(e) => handleChange('storeName', e.target.value)}
+                className="w-full bg-[#0B1120] text-slate-200 p-2.5 rounded-xl border border-blue-500/20 focus:border-cyan-400 focus:outline-none"
+              />
+            </div>
+
+            <div>
+              <label className="text-slate-400 mb-1 block">{isKu ? 'ناونیشانی لک / شوێن' : isAr ? 'عنوان الفرع أو الموقع' : 'Store Address'}</label>
+              <input
+                type="text"
+                value={settings.address || ''}
+                onChange={(e) => handleChange('address', e.target.value)}
+                className="w-full bg-[#0B1120] text-slate-200 p-2.5 rounded-xl border border-blue-500/20 focus:border-cyan-400 focus:outline-none"
+              />
+            </div>
+
+            <div>
+              <label className="text-slate-400 mb-1 block">{isKu ? 'ژمارەی مۆبایل / پەیوەندی' : isAr ? 'رقم هاتف المتجر / خدمة العملاء' : 'Store Phone'}</label>
+              <input
+                type="text"
+                value={settings.phone || ''}
+                onChange={(e) => handleChange('phone', e.target.value)}
+                className="w-full bg-[#0B1120] text-slate-200 p-2.5 rounded-xl border border-blue-500/20 focus:border-cyan-400 focus:outline-none font-mono"
+              />
+            </div>
+
+            <div>
+              <label className="text-slate-400 mb-1 block">{isKu ? 'ناوی عەرەبی بۆ پسوولە' : isAr ? 'اسم المتجر بالعربي' : 'Store Name (Arabic)'}</label>
+              <input
+                type="text"
+                value={settings.storeNameAr || ''}
+                onChange={(e) => handleChange('storeNameAr', e.target.value)}
+                className="w-full bg-[#0B1120] text-slate-200 p-2.5 rounded-xl border border-blue-500/20 focus:border-cyan-400 focus:outline-none"
+              />
+            </div>
+          </div>
+        </div>
+
+        {/* Currency and Financial Parameters */}
+        <div className="space-y-4 pt-4 border-t border-slate-800">
+          <h3 className="text-sm font-bold text-cyan-400 border-b border-slate-800 pb-2 flex items-center gap-2">
+            <DollarSign className="w-4 h-4 text-cyan-400" />
+            {isKu ? 'دراوی سەرەکی، باج و ئاستی کەمبوونەوەی کاڵا' : isAr ? 'العملة الأساسية والنسب الضريبية وحد التنبيه' : 'Currency & Financial Settings'}
+          </h3>
+
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs">
+            <div>
+              <label className="text-slate-400 mb-1 block">{isKu ? 'دراوی سیستەم' : isAr ? 'العملة المعتمدة' : 'Currency'}</label>
+              <select
+                value={settings.currencySymbol}
+                onChange={(e) => handleChange('currencySymbol', e.target.value)}
+                className="w-full bg-[#0B1120] text-slate-200 p-2.5 rounded-xl border border-blue-500/20 focus:border-cyan-400 focus:outline-none font-bold"
+              >
+                <option value="د.ع">د.ع IQD (دیناری عێراقی / دينار عراقي)</option>
+                <option value="$">$ USD (دۆلار / دولار أمريكي)</option>
+                <option value="ر.س">ر.س SAR (ڕیالی سعودی / ريال سعودي)</option>
+                <option value="ج.م">ج.م EGP (پاوەندی میسری / جنيه مصري)</option>
+                <option value="€">€ EUR (یۆرۆ / يورو)</option>
+              </select>
+            </div>
+
+            <div>
+              <label className="text-slate-400 mb-1 block">{isKu ? 'ڕێژەی باجی بەهای زیادکراو (%)' : isAr ? 'نسبة القيمة المضافة (%)' : 'VAT Tax Rate (%)'}</label>
+              <input
+                type="number"
+                value={settings.taxRate}
+                onChange={(e) => handleChange('taxRate', Number(e.target.value))}
+                className="w-full bg-[#0B1120] text-slate-200 p-2.5 text-center font-mono font-bold rounded-xl border border-blue-500/20 focus:border-cyan-400 focus:outline-none"
+              />
+            </div>
+
+            <div>
+              <label className="text-slate-400 mb-1 block">{isKu ? 'ئاستی کەمیی کاڵا لە کۆگا' : isAr ? 'حد انخفاض المخزون الافتراضي' : 'Low Stock Default'}</label>
+              <input
+                type="number"
+                value={settings.lowStockThresholdDefault}
+                onChange={(e) => handleChange('lowStockThresholdDefault', Number(e.target.value))}
+                className="w-full bg-[#0B1120] text-slate-200 p-2.5 text-center font-mono font-bold rounded-xl border border-blue-500/20 focus:border-cyan-400 focus:outline-none"
+              />
+            </div>
+          </div>
+        </div>
+
+        {/* Receipt Custom Messages */}
+        <div className="space-y-4 pt-4 border-t border-slate-800">
+          <h3 className="text-sm font-bold text-cyan-400 border-b border-slate-800 pb-2">
+            {isKu ? 'دەقی سەرەوە و ژێرەوەی پسوولەی چاپکراو' : isAr ? 'ترويسة وتذييل الفاتورة المطبوعة' : 'Receipt Messages'}
+          </h3>
+
+          <div className="space-y-3 text-xs">
+            <div>
+              <label className="text-slate-400 mb-1 block">{isKu ? 'پەیامی بەخێرهاتن لە سەرەوەی پسوولە' : isAr ? 'رسالة الترحيب أعلى الفاتورة' : 'Header Message'}</label>
+              <input
+                type="text"
+                value={settings.receiptHeaderMsg}
+                onChange={(e) => handleChange('receiptHeaderMsg', e.target.value)}
+                className="w-full bg-[#0B1120] text-slate-200 p-2.5 rounded-xl border border-blue-500/20 focus:border-cyan-400 focus:outline-none"
+              />
+            </div>
+
+            <div>
+              <label className="text-slate-400 mb-1 block">{isKu ? 'پەیامی سوپاسگوزاری و یاسای گەڕاندنەوە لە خوارەوە' : isAr ? 'رسالة الشكر وسياسة الترجيع في الأسفل' : 'Footer Return Policy Message'}</label>
+              <input
+                type="text"
+                value={settings.receiptFooterMsg}
+                onChange={(e) => handleChange('receiptFooterMsg', e.target.value)}
+                className="w-full bg-[#0B1120] text-slate-200 p-2.5 rounded-xl border border-blue-500/20 focus:border-cyan-400 focus:outline-none"
+              />
+            </div>
+          </div>
+
+          {/* 80mm Cashier Paper & Thermal Configuration */}
+          <div className="mt-4 p-4 rounded-2xl bg-gradient-to-r from-emerald-950/40 via-cyan-950/30 to-slate-900 border border-emerald-500/30 space-y-3">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-800">
+              <div className="flex items-center gap-3">
+                <div className="p-2.5 rounded-xl bg-emerald-500/20 text-emerald-300 border border-emerald-400/40">
+                  <Printer className="w-5 h-5 text-emerald-400" />
+                </div>
+                <div>
+                  <h4 className="text-xs font-bold text-white flex items-center gap-2">
+                    <span>{isKu ? 'تایبەتمەندی چاپی وەرەقەی کاشێر (80 ملم)' : isAr ? 'خاصية طباعة ورق كاشير (80 ملم - 80mm)' : '80mm Cashier Roll Printing'}</span>
+                    <span className="px-2 py-0.2 rounded-full bg-emerald-500/20 text-emerald-300 text-[10px] font-mono font-bold">Standard 80mm</span>
+                  </h4>
+                  <p className="text-[11px] text-slate-400 mt-0.5">
+                    {isKu 
+                      ? 'قەبارەی پەسەندکراوی پسوولەی کاشێر بۆ هەموو مارکێت و کۆگاکان لەگەڵ بارکۆدی تەواو' 
+                      : isAr 
+                      ? 'القياس المعتمد لطابعات الفواتير والكاشير (Epson, Xprinter, Rongta, Bixolon) مع إظهار باركود الأصناف والفاتورة بدقة.' 
+                      : 'Standard 80mm thermal roll layout with crisp item and invoice barcodes.'}
+                  </p>
+                </div>
+              </div>
+
+              {/* Test Print 80mm Button */}
+              <button
+                type="button"
+                onClick={() => {
+                  const sampleSale: SaleTransaction = {
+                    id: 'test-80mm-' + Date.now(),
+                    invoiceNumber: 'INV-80MM-' + Math.floor(1000 + Math.random() * 9000),
+                    cashierName: 'كاشير تجريبي',
+                    customerName: 'زبون عام',
+                    timestamp: new Date().toLocaleString(),
+                    items: [
+                      {
+                        productId: 'sample-1',
+                        productName: 'باراسيتامول 500 ملغ',
+                        productNameAr: 'باراسيتامول 500 ملغ',
+                        productNameKu: 'پاراسیتامۆڵ 500 ملغ',
+                        barcode: '200245819402',
+                        quantity: 2,
+                        saleType: 'retail',
+                        price: 1500,
+                        total: 3000,
+                      },
+                      {
+                        productId: 'sample-2',
+                        productName: 'أمۆکسیسيلين كبسول',
+                        productNameAr: 'أموكسيسيلين كبسول',
+                        productNameKu: 'ئەمۆکسیسلین کەپسول',
+                        barcode: '200245138592',
+                        quantity: 1,
+                        saleType: 'blister',
+                        price: 2500,
+                        total: 2500,
+                      }
+                    ],
+                    subtotal: 5500,
+                    discount: 0,
+                    tax: 0,
+                    total: 5500,
+                    amountTendered: 10000,
+                    changeDue: 4500,
+                    paymentMethod: 'cash',
+                    status: 'completed',
+                  };
+                  print80mmCashierReceipt(sampleSale, settings);
+                }}
+                className="px-4 py-2.5 rounded-xl bg-gradient-to-r from-emerald-500 to-teal-600 hover:brightness-110 text-slate-950 font-black text-xs flex items-center justify-center gap-1.5 shadow-[0_0_15px_rgba(16,185,129,0.3)] cursor-pointer transition-all active:scale-95 shrink-0"
+              >
+                <Printer className="w-4 h-4 text-slate-950" />
+                <span>{isKu ? 'تاقیکردنەوەی چاپی 80 ملم' : isAr ? 'تجربة طباعة وصل 80 مم' : 'Test 80mm Print'}</span>
+              </button>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3 text-xs pt-1">
+              <div>
+                <label className="text-slate-400 mb-1 block">{isKu ? 'قەبارەی پێشوەختەی پسوولە' : isAr ? 'قياس الورق الافتراضي للكاشير' : 'Default Paper Size'}</label>
+                <select
+                  value={settings.printerType || 'thermal80mm'}
+                  onChange={(e) => handleChange('printerType', e.target.value)}
+                  className="w-full bg-[#0B1120] text-emerald-300 p-2.5 rounded-xl border border-emerald-500/30 focus:border-emerald-400 focus:outline-none font-bold"
+                >
+                  <option value="thermal80mm">🧾 {isKu ? 'وەرەقەی کاشێر 80 ملم (پێشنیارکراو)' : isAr ? 'ورق كاشير 80 مم (الموصى به)' : '80mm Cashier Roll (Recommended)'}</option>
+                  <option value="thermal58mm">🧾 {isKu ? 'وەرەقەی کاشێر 58 ملم (بچووک)' : isAr ? 'ورق كاشير 58 مم (شريط صغير)' : '58mm Cashier Roll'}</option>
+                  <option value="a4">📄 {isKu ? 'قەبارەی A4 (پەڕەی گەورە)' : isAr ? 'ورق A4 كامل' : 'A4 Full Page'}</option>
+                  <option value="a5">📄 {isKu ? 'قەبارەی A5 (نیوە پەڕە)' : isAr ? 'ورق A5 نصف صفحة' : 'A5 Half Page'}</option>
+                </select>
+              </div>
+
+              <div>
+                <label className="text-slate-400 mb-1 block">{isKu ? 'ژمارەی لەبەرگیراوەکان (نسخ)' : isAr ? 'عدد نسخ الطباعة لكل عملية' : 'Print Copies'}</label>
+                <input
+                  type="number"
+                  min="1"
+                  max="5"
+                  value={settings.printerCopies || 1}
+                  onChange={(e) => handleChange('printerCopies', Math.max(1, Number(e.target.value)))}
+                  className="w-full bg-[#0B1120] text-slate-200 p-2.5 text-center font-mono font-bold rounded-xl border border-blue-500/20 focus:border-cyan-400 focus:outline-none"
+                />
+              </div>
+
+              <div>
+                <label className="text-slate-400 mb-1 block">{isKu ? 'کۆنترۆڵی بارکۆدی پسوولە' : isAr ? 'إظهار باركود الفاتورة والمواد' : 'Show Barcode on Receipts'}</label>
+                <div className="p-2 bg-[#0B1120] rounded-xl border border-emerald-500/20 flex items-center justify-between text-xs">
+                  <span className="text-slate-300 font-bold">{isKu ? 'چالاکە' : isAr ? 'مفعل دائماً' : 'Enabled'}</span>
+                  <span className="px-2 py-0.5 rounded-md bg-emerald-500/20 text-emerald-300 font-mono text-[10px] font-bold">80mm Ready</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* Direct Silent Printing Setup Block */}
+          <div className="mt-4 p-4 rounded-2xl bg-cyan-950/30 border border-cyan-500/30 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+            <div className="flex items-center gap-3">
+              <div className="p-2.5 rounded-xl bg-cyan-500/20 text-cyan-300 border border-cyan-400/40">
+                <Zap className="w-5 h-5 animate-pulse" />
+              </div>
+              <div>
+                <h4 className="text-xs font-bold text-white flex items-center gap-2">
+                  <span>{isKu ? 'تایبەتمەندی چاپی بێ دەنگ و دەستبەجێ (بێ پەنجەرەی گۆگڵ کرۆم)' : isAr ? 'إلغاء نافذة المتصفح والطباعة الفورية الصامتة (0-Click Silent Print)' : 'Instant Silent Thermal Receipt Printing'}</span>
+                  <span className="px-2 py-0.2 rounded-full bg-cyan-500/20 text-cyan-300 text-[10px] font-mono">0.1s Fast</span>
+                </h4>
+                <p className="text-[11px] text-slate-400 mt-0.5">
+                  {isKu 
+                    ? 'پەڕگەی مشغل (.bat) یان بەستنەوەی پرنتەر لە ڕێگەی کێبڵی راستەوخۆی USB' 
+                    : isAr 
+                    ? 'شغّل المنظومة عبر ملف الاختصار (.bat) أو قم بربط الطابعة الحرارية مباشرة عبر كابل USB Serial.' 
+                    : 'Run via silent .bat launcher or direct USB Web Serial connection.'}
+                </p>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2 w-full sm:w-auto">
+              <button
+                type="button"
+                onClick={() => downloadKioskPrintingBatchFile()}
+                className="flex-1 sm:flex-none px-3 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs flex items-center justify-center gap-1.5 shadow-md cursor-pointer transition-all"
+              >
+                <Download className="w-3.5 h-3.5" />
+                <span>{isKu ? 'داگرتنی مشغل (.bat)' : isAr ? 'تحميل المشغل (.bat)' : 'Download .bat'}</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setIsKioskModalOpen(true)}
+                className="flex-1 sm:flex-none px-3 py-2 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white font-bold text-xs flex items-center justify-center gap-1.5 shadow-md cursor-pointer transition-all"
+              >
+                <Laptop className="w-3.5 h-3.5" />
+                <span>{isKu ? 'ڕێبەری تەواو' : isAr ? 'خيارات الربط والدليل' : 'Setup Guide'}</span>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        {/* Google Gemini AI Vision & OCR Built-in Status Section */}
+        <div className="space-y-4 pt-4 border-t border-slate-800">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-2">
+              <div className="p-2 rounded-xl bg-gradient-to-br from-indigo-500/20 to-purple-500/20 text-purple-300 border border-purple-400/40">
+                <Sparkles className="w-4 h-4 text-purple-300" />
+              </div>
+              <div>
+                <h3 className="text-sm font-bold text-transparent bg-clip-text bg-gradient-to-r from-purple-400 via-pink-300 to-cyan-300 flex items-center gap-2">
+                  <span>{isKu ? 'سیستەمی زیرەکی دەستکرد (Google Gemini AI Vision)' : isAr ? 'محرك الذكاء الاصطناعي لفحص الصور والفواتير (Google Gemini AI)' : 'Google Gemini AI Vision System'}</span>
+                  <span className="px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 text-[10px] font-mono border border-emerald-500/30">مفعل وتلقائي 100%</span>
+                </h3>
+                <p className="text-[11px] text-slate-400">
+                  {isKu 
+                    ? 'بۆ پشکنینی ڕاستەوخۆی وێنەی پسوولەکان، خوێندنەوەی دەرمان و پاکەت، و گواستنەوەی داتاکان بەبێ پێویستی بە کلیل'
+                    : isAr 
+                    ? 'لفحص الفواتير الورقية آلياً، وقراءة علب الأدوية وملفات PDF واستيراد المواد بدون الحاجة لإدخال أي مفتاح'
+                    : 'Automatic invoice OCR, PDF reading, medicine recognition and legacy migration built-in without manual keys'}
+                </p>
+              </div>
+            </div>
+
+            <button
+              type="button"
+              onClick={handleTestGeminiKey}
+              disabled={testStatus.loading}
+              className="text-[11px] px-3.5 py-1.5 rounded-xl bg-gradient-to-r from-cyan-600 via-blue-600 to-indigo-600 hover:brightness-110 text-white font-bold flex items-center gap-1.5 shadow-[0_0_12px_rgba(6,182,212,0.3)] transition-all cursor-pointer disabled:opacity-50"
+            >
+              {testStatus.loading ? (
+                <RefreshCw className="w-3 h-3 animate-spin" />
+              ) : (
+                <Zap className="w-3 h-3 text-cyan-300" />
+              )}
+              <span>{isKu ? 'تاقیکردنەوەی خزمەتگوزاری' : isAr ? 'فحص جاهزية الذكاء الاصطناعي' : 'Check AI Status'}</span>
+            </button>
+          </div>
+
+          <div className="p-4 rounded-2xl bg-gradient-to-b from-[#11162B] to-[#0A0E1C] border border-purple-500/30 shadow-xl space-y-3">
+            <div className="p-3 rounded-xl bg-emerald-950/40 border border-emerald-500/30 flex items-start gap-3 text-xs">
+              <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
+              <div className="space-y-1 text-[11px] leading-relaxed text-slate-300">
+                <p className="font-bold text-emerald-200">
+                  {isKu 
+                    ? '✅ خزمەتگوزاری خوێندنەوەی وێنە و PDF بە شێوەی ڕاستەوخۆ چالاکە و هیچ داواکارییەکی کلیل ناکات' 
+                    : isAr 
+                    ? '✅ نظام إضافة الأدوية بالصور أو بملفات PDF مدمج ومفعل بالكامل ويعمل مباشرة دون طلب أي مفتاح' 
+                    : '✅ Image and PDF medicine extraction system is fully active and operational without requiring any API keys'}
+                </p>
+                <p className="text-slate-400">
+                  {isKu
+                    ? 'دەتوانیت لە بەشی کاڵاکان یان کڕین، ڕاستەوخۆ وێنەی پسوولەی دەرمان یان فایلی PDF هەڵبژێریت و سیستمەکە هەموو دەرمانەکان دەخوێنێتەوە.'
+                    : isAr
+                    ? 'يمكنك التوجه إلى تبويب المواد أو المشتريات واختيار أي صورة فاتورة أو ملف PDF، وسيتم استخراج وتحديث أسعار وتفاصيل وباركودات الأدوية فوراً.'
+                    : 'You can directly upload invoice photos or PDF files in Products or Purchases tabs for instant medicine extraction.'}
+                </p>
+              </div>
+            </div>
+
+            {/* Test Status Feedback Banner */}
+            {testStatus.message && (
+              <div
+                className={`p-3 rounded-xl border text-xs flex items-center gap-2.5 animate-fadeIn ${
+                  testStatus.success
+                    ? 'bg-emerald-950/70 border-emerald-500/50 text-emerald-300'
+                    : 'bg-cyan-950/70 border-cyan-500/50 text-cyan-300'
+                }`}
+              >
+                <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                <div className="flex-1">
+                  <p className="font-bold">{testStatus.message}</p>
+                  {testStatus.model && (
+                    <p className="text-[10px] opacity-80 mt-0.5 font-mono">
+                      Active AI Engine: {testStatus.model} | Mode: Vision OCR & Multimodal
+                    </p>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Data Security & Automatic Persistence Banner */}
+        <div className="space-y-4 pt-4 border-t border-slate-800">
+          <div className="flex items-center justify-between">
+            <h3 className="text-sm font-bold text-emerald-400 flex items-center gap-2">
+              <Database className="w-4 h-4 text-emerald-400" />
+              <span>{isKu ? 'پاشەکەوتکردن و هاوردە/هەناردەی گشتی داتاکان' : isAr ? 'النسخ الاحتياطي وإدارة تصدير واستيراد بيانات المنظومة' : 'Data Backup, Export & Import Management'}</span>
+            </h3>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setIsGoogleDriveModalOpen(true)}
+                className="text-xs px-3.5 py-1.5 rounded-xl bg-gradient-to-r from-cyan-500 via-blue-600 to-emerald-500 text-slate-950 font-black flex items-center gap-1.5 shadow-[0_0_15px_rgba(6,182,212,0.4)] hover:brightness-110 active:scale-95 transition-all cursor-pointer border border-cyan-300/40 animate-pulse"
+              >
+                <Cloud className="w-3.5 h-3.5 text-slate-950 fill-current" />
+                <span>{isKu ? '☁️ پاشەکەوتی Google Drive' : isAr ? '☁️ النسخ السحابي (Google Drive)' : '☁️ Google Drive Backup'}</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setIsStressTestModalOpen(true)}
+                className="text-xs px-3.5 py-1.5 rounded-xl bg-gradient-to-r from-amber-600 via-orange-600 to-amber-500 text-slate-950 font-black flex items-center gap-1.5 shadow-[0_0_15px_rgba(245,158,11,0.3)] hover:brightness-110 active:scale-95 transition-all cursor-pointer border border-amber-400/40"
+              >
+                <Zap className="w-3.5 h-3.5 text-slate-950 fill-current" />
+                <span>{isKu ? '⚡ تاقیکردنەوەی 100 هەزار+ داتا' : isAr ? '⚡ توليد 100 ألف مادة للتجربة' : '⚡ 100k+ Stress Test Data'}</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setIsDbStorageModalOpen(true)}
+                className="text-xs px-3.5 py-1.5 rounded-xl bg-gradient-to-r from-cyan-600 to-blue-600 text-white font-black flex items-center gap-1.5 shadow-[0_0_15px_rgba(6,182,212,0.3)] hover:brightness-110 active:scale-95 transition-all cursor-pointer border border-cyan-400/40"
+              >
+                <Database className="w-3.5 h-3.5 text-cyan-200" />
+                <span>{isKu ? '💾 ناوەندی داتابەیسی ناوخۆیی (IndexedDB)' : isAr ? '💾 محرك قاعدة البيانات وسعة التخزين' : '💾 Local Database & Storage Engine'}</span>
+              </button>
+
+              <span className="text-[11px] px-2.5 py-1 rounded-full bg-emerald-500/10 text-emerald-300 border border-emerald-500/30 font-bold flex items-center gap-1.5">
+                <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
+                <span>{isKu ? 'سیستەمی پاراستنی داتا' : isAr ? 'نظام الحفظ المتكامل' : 'Safe Storage'}</span>
+              </span>
+            </div>
+          </div>
+
+          <div className="p-4 sm:p-5 rounded-2xl bg-gradient-to-b from-[#0B1528] to-[#070D18] border border-blue-500/30 shadow-xl space-y-4">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-800/80">
+              <div className="space-y-1">
+                <div className="flex items-center gap-2 text-emerald-300 font-bold text-xs sm:text-sm">
+                  <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0" />
+                  <span>{isKu ? 'داتاکان تەواو جیاکراوەن و تایبەتن بەم ئامێرە (تەواو سەربەخۆیە)' : isAr ? 'البيانات معزولة وخاصة بهذا الجهاز فقط (غير مرتبطة بأي لابتوب آخر)' : 'Private Local Database (Isolated per Device)'}</span>
+                </div>
+                <p className="text-slate-300 text-[11px] leading-relaxed max-w-2xl">
+                  {isKu
+                    ? 'هەموو زانیارییەکان (کاڵاکان، نرخەکان، کڕینەکان، دابینکەران، فرۆشتنەکان، مەندوب، قەرزارەکان، و ڕاپۆرتەکان) لەناو کۆگای ئەم لابتۆپە پاشەکەوت دەبن بە شێوەیەکی سەربەخۆ، و ئامێرەکانی تر ناتوانن بیبینن.'
+                    : isAr
+                    ? 'كافة بيانات المنظومة (المواد، الأسعار، المبيعات، الفواتير، الموردين، العملاء، المصاريف، التقارير واللغات والوضع الليلي) تُخزن وتُعالج محلياً على هذا الجهاز بشكل منعزل ومستقل تماماً، ولا يمكن لأي جهاز أو لابتوب آخر رؤيتها أو التأثير عليها.'
+                    : 'All system data (products, prices, sales, purchases, suppliers, customers, expenses, settings, and theme) are processed and stored locally on this machine with total offline isolation.'}
+                </p>
+              </div>
+
+              {importStatus && (
+                <div className="px-3.5 py-2 rounded-xl bg-emerald-950/90 border border-emerald-500/60 text-emerald-300 font-bold text-xs shrink-0 animate-pulse flex items-center gap-1.5 shadow-lg">
+                  <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                  <span>{importStatus}</span>
+                </div>
+              )}
+            </div>
+
+            {/* Organized Export & Import Actions Grid */}
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3 pt-1">
+              
+              {/* Primary Action Card: Comprehensive All-In-One Export */}
+              <div className="p-3.5 rounded-xl bg-gradient-to-r from-emerald-950/40 via-teal-950/30 to-slate-900/60 border border-emerald-500/40 flex flex-col justify-between gap-3">
+                <div>
+                  <div className="flex items-center gap-2 text-emerald-300 font-bold text-xs">
+                    <FileSpreadsheet className="w-4 h-4 text-emerald-400" />
+                    <span>{isKu ? 'هەناردەکردنی گشتگیری هەموو داتاکان' : isAr ? 'تصدير شامل لكافة بيانات البرنامج والتقارير' : 'Master Export (All Program Data)'}</span>
+                  </div>
+                  <p className="text-[11px] text-slate-400 mt-1">
+                    {isKu
+                      ? 'هەناردەی (کاڵاکان، نرخ، فرۆشتن، کڕین، مەندوب، دابینکەران، کڕیاران، خەرجی، و تەواوی ڕاپۆرتە داراییەکان) بۆ ناو فایلی Excel .xlsx'
+                      : isAr
+                      ? 'تصدير (المواد، الأسعار، المبيعات، المشتريات، الموردين، المندوب، ديون العملاء، المصاريف، والتفاصيل المالية الشاملة) في ملف Excel .xlsx واحد منظم.'
+                      : 'Exports products, prices, sales, purchases, suppliers, delegates, expenses, and full reports into multi-sheet Excel.'}
+                  </p>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2 pt-1">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const currentProducts = products || JSON.parse(localStorage.getItem('supermarket_products_v1') || '[]');
+                      const currentSales = salesHistory || JSON.parse(localStorage.getItem('supermarket_sales_v1') || '[]');
+                      const currentSuppliers = suppliers || JSON.parse(localStorage.getItem('supermarket_suppliers_v1') || '[]');
+                      const currentCustomers = customers || JSON.parse(localStorage.getItem('supermarket_customers_v1') || '[]');
+                      const currentPurchases = purchaseInvoices || JSON.parse(localStorage.getItem('supermarket_purchases_v1') || '[]');
+                      const currentUsers = userAccounts || JSON.parse(localStorage.getItem('supermarket_user_accounts_v3') || localStorage.getItem('supermarket_user_accounts_v1') || '[]');
+                      const currentOrders = orders || JSON.parse(localStorage.getItem('supermarket_orders_v1') || '[]');
+                      const currentNotifs = notifications || JSON.parse(localStorage.getItem('supermarket_notifications_v1') || '[]');
+                      const currentDamaged = JSON.parse(localStorage.getItem('pos_damaged_items_logs') || '[]');
+                      const currentDelegateReturns = JSON.parse(localStorage.getItem('pos_delegate_returns_logs') || '[]');
+                      const currentExpenses = JSON.parse(localStorage.getItem('pos_custom_operating_expenses') || '[]');
+                      const currentExpenseTypes = JSON.parse(localStorage.getItem('pos_custom_expense_types') || '[]');
+                      const currentCashAdjustments = JSON.parse(localStorage.getItem('pos_cash_adjustments') || '[]');
+                      const currentInventoryAudits = JSON.parse(localStorage.getItem('pos_inventory_audits_v1') || '[]');
+
+                      exportStoreToExcel({
+                        products: currentProducts,
+                        salesHistory: currentSales,
+                        suppliers: currentSuppliers,
+                        customers: currentCustomers,
+                        purchaseInvoices: currentPurchases,
+                        userAccounts: currentUsers,
+                        orders: currentOrders,
+                        notifications: currentNotifs,
+                        damagedLogs: currentDamaged,
+                        delegateReturns: currentDelegateReturns,
+                        operatingExpenses: currentExpenses,
+                        customExpenseTypes: currentExpenseTypes,
+                        cashAdjustments: currentCashAdjustments,
+                        inventoryAudits: currentInventoryAudits,
+                        settings: settings,
+                        exportedAt: new Date().toISOString()
+                      });
+                    }}
+                    className="flex-1 min-w-[200px] px-4 py-2.5 rounded-xl bg-gradient-to-r from-emerald-600 via-teal-600 to-green-600 hover:from-emerald-500 hover:to-teal-500 text-white font-black text-xs flex items-center justify-center gap-2 transition-all cursor-pointer shadow-[0_0_15px_rgba(16,185,129,0.3)] hover:brightness-110 active:scale-95 border border-emerald-400/40"
+                  >
+                    <FileSpreadsheet className="w-4 h-4 text-emerald-100 shrink-0" />
+                    <span>{isKu ? 'تصدير هەموو داتاکان و ڕاپۆرتەکان (Excel)' : isAr ? 'تصدير كافة البيانات والتقارير الشاملة (Excel .xlsx)' : 'Export Full Store & Reports (Excel)'}</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const fullBackup = {
+                        products: products || JSON.parse(localStorage.getItem('supermarket_products_v1') || '[]'),
+                        salesHistory: salesHistory || JSON.parse(localStorage.getItem('supermarket_sales_v1') || '[]'),
+                        suppliers: suppliers || JSON.parse(localStorage.getItem('supermarket_suppliers_v1') || '[]'),
+                        customers: customers || JSON.parse(localStorage.getItem('supermarket_customers_v1') || '[]'),
+                        purchaseInvoices: purchaseInvoices || JSON.parse(localStorage.getItem('supermarket_purchases_v1') || '[]'),
+                        userAccounts: userAccounts || JSON.parse(localStorage.getItem('supermarket_user_accounts_v3') || localStorage.getItem('supermarket_user_accounts_v1') || '[]'),
+                        orders: orders || JSON.parse(localStorage.getItem('supermarket_orders_v1') || '[]'),
+                        notifications: notifications || JSON.parse(localStorage.getItem('supermarket_notifications_v1') || '[]'),
+                        damagedLogs: JSON.parse(localStorage.getItem('pos_damaged_items_logs') || '[]'),
+                        delegateReturns: JSON.parse(localStorage.getItem('pos_delegate_returns_logs') || '[]'),
+                        operatingExpenses: JSON.parse(localStorage.getItem('pos_custom_operating_expenses') || '[]'),
+                        customExpenseTypes: JSON.parse(localStorage.getItem('pos_custom_expense_types') || '[]'),
+                        cashAdjustments: JSON.parse(localStorage.getItem('pos_cash_adjustments') || '[]'),
+                        inventoryAudits: JSON.parse(localStorage.getItem('pos_inventory_audits_v1') || '[]'),
+                        settings: settings || JSON.parse(localStorage.getItem('supermarket_settings_v3') || localStorage.getItem('supermarket_settings_v1') || '{}'),
+                        exportedAt: new Date().toISOString()
+                      };
+                      const blob = new Blob([JSON.stringify(fullBackup, null, 2)], { type: 'application/json' });
+                      const url = URL.createObjectURL(blob);
+                      const a = document.createElement('a');
+                      a.href = url;
+                      a.download = `supermarket_store_full_backup_${new Date().toISOString().split('T')[0]}.json`;
+                      a.click();
+                      URL.revokeObjectURL(url);
+                    }}
+                    title={isKu ? 'هەناردەی پەڕگەی JSON بۆ گواستنەوەی تەواو' : isAr ? 'تصدير نسخة احتياطية تقنية JSON' : 'Export JSON Backup'}
+                    className="px-3 py-2.5 rounded-xl bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-300 border border-cyan-500/40 font-bold text-xs flex items-center justify-center gap-1.5 transition-all cursor-pointer shadow-sm shrink-0"
+                  >
+                    <Download className="w-4 h-4" />
+                    <span>JSON</span>
+                  </button>
+                </div>
+              </div>
+
+              {/* Secondary Actions Card: Selective Products & Import Backup */}
+              <div className="p-3.5 rounded-xl bg-gradient-to-r from-blue-950/40 via-indigo-950/30 to-slate-900/60 border border-blue-500/40 flex flex-col justify-between gap-3">
+                <div>
+                  <div className="flex items-center gap-2 text-cyan-300 font-bold text-xs">
+                    <Upload className="w-4 h-4 text-cyan-400" />
+                    <span>{isKu ? 'هاوردەکردن و هەناردەکردنی تایبەتی کاڵاکان' : isAr ? 'استيراد نسخة احتياطية وتصدير جدول المواد' : 'Restore Backup & Export Products'}</span>
+                  </div>
+                  <p className="text-[11px] text-slate-400 mt-1">
+                    {isKu
+                      ? 'دەتوانیت تەنها خشتەی کاڵاکان هەناردە بکەیت یان پەڕگەی پێشووت (Excel / JSON) هاوردە بکەیتەوە ناو سیستم.'
+                      : isAr
+                      ? 'يمكنك استيراد نسخة احتياطية سابقة لاستعادة كافة البيانات، أو تصدير جدول المواد والأسعار فقط لتعديلها.'
+                      : 'Restore your database from any previously exported Excel/JSON file or export products list only.'}
+                  </p>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2 pt-1">
+                  {/* Hidden File Input for Importing Backup (.json or .xlsx) */}
+                  <input
+                    type="file"
+                    ref={fileInputRef}
+                    accept=".json, .xlsx, .xls"
+                    className="hidden"
+                    onChange={async (e) => {
+                      const file = e.target.files?.[0];
+                      if (!file) return;
+
+                      try {
+                        if (file.name.endsWith('.xlsx') || file.name.endsWith('.xls')) {
+                          const excelParsed = await parseExcelBackupFile(file);
+                          const hasData = (excelParsed.products && excelParsed.products.length > 0) ||
+                            (excelParsed.suppliers && excelParsed.suppliers.length > 0) ||
+                            (excelParsed.customers && excelParsed.customers.length > 0) ||
+                            (excelParsed.purchaseInvoices && excelParsed.purchaseInvoices.length > 0);
+
+                          if (hasData) {
+                            let mergedProducts = excelParsed.products;
+                            if (excelParsed.products && excelParsed.products.length > 0) {
+                              const existingProds = products || JSON.parse(localStorage.getItem('supermarket_products_v1') || '[]');
+                              const merged = [...excelParsed.products];
+                              existingProds.forEach((p: Product) => {
+                                if (!merged.some(m => m.barcode && p.barcode && m.barcode === p.barcode)) {
+                                  merged.push(p);
+                                }
+                              });
+                              mergedProducts = merged;
+                            }
+
+                            const backupPayload = {
+                              ...excelParsed,
+                              products: mergedProducts
+                            };
+
+                            if (onImportBackup) {
+                              onImportBackup(backupPayload);
+                            } else {
+                              if (mergedProducts) {
+                                localStorage.setItem('supermarket_products_v1', JSON.stringify(mergedProducts));
+                                syncBulkWriteCollection('products', mergedProducts);
+                              }
+                              if (excelParsed.suppliers) {
+                                localStorage.setItem('supermarket_suppliers_v1', JSON.stringify(excelParsed.suppliers));
+                                syncBulkWriteCollection('suppliers', excelParsed.suppliers);
+                              }
+                              if (excelParsed.customers) {
+                                localStorage.setItem('supermarket_customers_v1', JSON.stringify(excelParsed.customers));
+                                syncBulkWriteCollection('customers', excelParsed.customers);
+                              }
+                              if (excelParsed.purchaseInvoices) {
+                                localStorage.setItem('supermarket_purchases_v1', JSON.stringify(excelParsed.purchaseInvoices));
+                                syncBulkWriteCollection('purchases', excelParsed.purchaseInvoices);
+                              }
+                            }
+
+                            const prodCount = excelParsed.products?.length || 0;
+                            const supCount = excelParsed.suppliers?.length || 0;
+                            const custCount = excelParsed.customers?.length || 0;
+                            setImportStatus(isKu ? `✅ بە سەرکەوتوویی هەموو داتاکان (${prodCount} کاڵا، ${supCount} دابینکەر، ${custCount} کڕیار) هاوردەکران!` : isAr ? `✅ تم استيراد واستعادة كافة البيانات بنجاح (${prodCount} مادة، ${supCount} مورد، ${custCount} عميل)!` : `✅ Successfully imported all data (${prodCount} products, ${supCount} suppliers, ${custCount} customers)!`);
+                            setTimeout(() => setImportStatus(''), 6000);
+                          } else {
+                            alert(isKu ? 'هیچ داتایەکی دروست لە فایلی ئێکسڵ نەدۆزرایەوە!' : isAr ? 'لم يتم العثور على أوراق بيانات صالحة في ملف الإكسل!' : 'No valid data sheets found in Excel file!');
+                          }
+                        } else {
+                          const text = await file.text();
+                          const parsed = JSON.parse(text);
+                          if (onImportBackup) {
+                            onImportBackup(parsed);
+                            setImportStatus(isKu ? '✅ داتاکان بە سەرکەوتوویی هاوردەکران لە JSON!' : isAr ? '✅ تم استيراد النسخة الاحتياطية بنجاح من JSON!' : '✅ Backup restored successfully from JSON!');
+                            setTimeout(() => setImportStatus(''), 6000);
+                          }
+                        }
+                      } catch (err) {
+                        console.error('Import error:', err);
+                        alert(isKu ? 'هەڵە ڕوویدا لە کاتی هاوردەکردنی پەڕگەکە!' : isAr ? 'حدث خطأ أثناء قراءة ملف النسخ الاحتياطي!' : 'Error parsing backup file!');
+                      }
+                    }}
+                  />
+
+                  {/* Import Button */}
+                  <button
+                    type="button"
+                    onClick={() => fileInputRef.current?.click()}
+                    className="flex-1 min-w-[160px] px-4 py-2.5 rounded-xl bg-gradient-to-r from-amber-600 to-orange-600 hover:from-amber-500 hover:to-orange-500 text-white font-black text-xs flex items-center justify-center gap-1.5 transition-all cursor-pointer shadow-[0_0_15px_rgba(245,158,11,0.25)] hover:brightness-110 active:scale-95 border border-amber-400/40"
+                  >
+                    <Upload className="w-4 h-4 text-amber-100 shrink-0" />
+                    <span>{isKu ? '📥 هاوردەکردنی فایل (Excel / JSON)' : isAr ? '📥 استيراد نسخة احتياطية (Excel / JSON)' : '📥 Import Backup (Excel / JSON)'}</span>
+                  </button>
+
+                  {/* Products Only Export */}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const currentProducts = products || JSON.parse(localStorage.getItem('supermarket_products_v1') || '[]');
+                      exportProductsToExcel(currentProducts, `products_catalog_${new Date().toISOString().split('T')[0]}.xlsx`);
+                    }}
+                    className="px-3.5 py-2.5 rounded-xl bg-teal-500/20 hover:bg-teal-500/30 text-teal-300 border border-teal-500/40 font-bold text-xs flex items-center justify-center gap-1.5 transition-all cursor-pointer shadow-sm shrink-0"
+                    title={isKu ? 'هەناردەی تەنها خشتەی کاڵاکان بۆ ئێکسڵ' : isAr ? 'تصدير جدول المواد والأسعار فقط' : 'Export Products List'}
+                  >
+                    <FileSpreadsheet className="w-4 h-4" />
+                    <span>{isKu ? 'خشتەی کاڵاکان' : isAr ? 'جدول المواد' : 'Products List'}</span>
+                  </button>
+                </div>
+              </div>
+
+            </div>
+
+            {/* Automated Scheduled Backup Section (النسخ الاحتياطي التلقائي المجدول: كل ساعة أو يومياً + أوفلاين) */}
+            <div className="mt-4 p-4 sm:p-5 rounded-2xl bg-gradient-to-br from-cyan-950/30 via-slate-900/90 to-blue-950/30 border border-cyan-500/40 shadow-[0_0_20px_rgba(6,182,212,0.15)] relative overflow-hidden">
+              <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 border-b border-cyan-500/20 pb-4">
+                <div className="flex items-start gap-3">
+                  <div className="p-3 rounded-2xl bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 shrink-0 shadow-[0_0_15px_rgba(6,182,212,0.3)]">
+                    <Clock className="w-6 h-6 text-cyan-400" />
+                  </div>
+                  <div>
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <h4 className="text-sm sm:text-base font-black text-white">
+                        {isKu ? 'کۆپیکردنی یەدەگی خۆکار (هەموو کاتژمێرێک یان ڕۆژانە)' : isAr ? 'النسخ الاحتياطي التلقائي المجدول (كل ساعة / يومياً)' : 'Automated Scheduled Backup (Hourly / Daily)'}
+                      </h4>
+                      <span className={`px-2.5 py-0.5 rounded-full text-[10px] font-bold border flex items-center gap-1 ${
+                        settings.autoBackupEnabled !== false && settings.autoBackupFrequency !== 'disabled'
+                          ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40'
+                          : 'bg-slate-700/40 text-slate-400 border-slate-600/40'
+                      }`}>
+                        <span className={`w-1.5 h-1.5 rounded-full ${
+                          settings.autoBackupEnabled !== false && settings.autoBackupFrequency !== 'disabled' ? 'bg-emerald-400 animate-pulse' : 'bg-slate-400'
+                        }`} />
+                        {settings.autoBackupEnabled !== false && settings.autoBackupFrequency !== 'disabled'
+                          ? (isKu ? 'چالاکە (لە پاشبنەما کار دەکات)' : isAr ? 'نشط (يعمل في الخلفية أوفلاين)' : 'Active Offline')
+                          : (isKu ? 'ناچالاکە' : isAr ? 'معطل' : 'Disabled')}
+                      </span>
+                    </div>
+                    <p className="text-xs text-slate-300 mt-1 leading-relaxed max-w-2xl">
+                      {isKu
+                        ? 'سیستەم بە شێوەیەکی ئۆتۆماتیکی و بەبێ پێویستی بە ئینتەرنێت، کۆپییەکی تەواو لە هەموو کاڵاکان، فرۆشتنەکان، کڕینەکان و قەرزەکان هەڵدەگرێت بۆ پاراستنی داتاکانت.'
+                        : isAr
+                        ? 'يقوم البرنامج تلقائياً وبشكل دوري في الخلفية بحفظ نسخة احتياطية شاملة لكافة المواد، المبيعات، الفواتير، والعملاء بدون الحاجة لأي اتصال بالإنترنت (100% أوفلاين).'
+                        : 'The system automatically creates a full database backup in the background according to your schedule, working 100% offline without requiring internet.'}
+                    </p>
+                  </div>
+                </div>
+
+                {/* Immediate Backup Now Action Button */}
+                <div className="flex items-center gap-2 shrink-0">
+                  <button
+                    type="button"
+                    onClick={handleBackupNow}
+                    disabled={isTakingBackup}
+                    className="px-4 py-2.5 rounded-xl bg-gradient-to-r from-cyan-600 via-blue-600 to-indigo-600 hover:from-cyan-500 hover:to-blue-500 text-white font-black text-xs flex items-center justify-center gap-2 transition-all cursor-pointer shadow-[0_0_15px_rgba(6,182,212,0.3)] hover:brightness-110 active:scale-95 border border-cyan-400/40 disabled:opacity-50"
+                  >
+                    {isTakingBackup ? (
+                      <RefreshCw className="w-4 h-4 animate-spin text-cyan-200" />
+                    ) : (
+                      <Zap className="w-4 h-4 text-cyan-200" />
+                    )}
+                    <span>
+                      {isTakingBackup
+                        ? (isKu ? 'کۆپیکردن...' : isAr ? 'جاري النسخ الآن...' : 'Backing up...')
+                        : (isKu ? '⚡ کۆپیکردنی یەدەگ ئێستا' : isAr ? '⚡ أخذ نسخة احتياطية الآن' : '⚡ Backup Now')}
+                    </span>
+                  </button>
+                </div>
+              </div>
+
+              {/* Status Notice Banner */}
+              {backupNotice && (
+                <div className={`mt-3 p-3 rounded-xl border text-xs font-bold flex items-center justify-between gap-2 transition-all animate-in fade-in ${
+                  backupNotice.type === 'success'
+                    ? 'bg-emerald-950/60 border-emerald-500/40 text-emerald-300'
+                    : 'bg-rose-950/60 border-rose-500/40 text-rose-300'
+                }`}>
+                  <div className="flex items-center gap-2">
+                    <CheckCircle2 className="w-4 h-4 shrink-0" />
+                    <span>{backupNotice.text}</span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setBackupNotice(null)}
+                    className="text-slate-400 hover:text-white text-xs px-1"
+                  >
+                    ✕
+                  </button>
+                </div>
+              )}
+
+              {/* Controls Grid */}
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mt-4">
+                
+                {/* 1. Schedule Frequency Selector */}
+                <div className="p-3.5 rounded-xl bg-slate-900/80 border border-slate-700/60 flex flex-col justify-between gap-2.5">
+                  <div className="flex items-center justify-between">
+                    <label className="text-xs font-bold text-slate-200 flex items-center gap-1.5">
+                      <Clock className="w-4 h-4 text-cyan-400" />
+                      <span>{isKu ? 'وتیرەی کۆپیکردن (Frequency):' : isAr ? 'وتيرة النسخ التلقائي:' : 'Backup Frequency:'}</span>
+                    </label>
+                    
+                    {/* Toggle Enabled / Disabled */}
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setSettings(prev => ({
+                          ...prev,
+                          autoBackupEnabled: prev.autoBackupEnabled === false ? true : false
+                        }))
+                      }
+                      className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
+                        settings.autoBackupEnabled !== false ? 'bg-cyan-600' : 'bg-slate-700'
+                      }`}
+                      title={settings.autoBackupEnabled !== false ? 'إيقاف النسخ التلقائي' : 'تشغيل النسخ التلقائي'}
+                    >
+                      <span
+                        className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow-lg ring-0 transition duration-200 ease-in-out ${
+                          settings.autoBackupEnabled !== false ? 'translate-x-4 rtl:-translate-x-4' : 'translate-x-0'
+                        }`}
+                      />
+                    </button>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-1.5">
+                    {/* Hourly Button */}
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setSettings(prev => ({
+                          ...prev,
+                          autoBackupFrequency: 'hourly',
+                          autoBackupEnabled: true
+                        }))
+                      }
+                      className={`px-3 py-2 rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 transition-all cursor-pointer border ${
+                        settings.autoBackupFrequency === 'hourly' || !settings.autoBackupFrequency
+                          ? 'bg-cyan-600/30 text-cyan-200 border-cyan-400 shadow-[0_0_10px_rgba(6,182,212,0.3)]'
+                          : 'bg-slate-800/60 text-slate-400 border-slate-700 hover:text-slate-200'
+                      }`}
+                    >
+                      <Clock className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
+                      <span>{isKu ? 'هەموو کاتژمێرێک' : isAr ? '⏱️ كل ساعة' : 'Hourly'}</span>
+                    </button>
+
+                    {/* Daily Button */}
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setSettings(prev => ({
+                          ...prev,
+                          autoBackupFrequency: 'daily',
+                          autoBackupEnabled: true
+                        }))
+                      }
+                      className={`px-3 py-2 rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 transition-all cursor-pointer border ${
+                        settings.autoBackupFrequency === 'daily'
+                          ? 'bg-emerald-600/30 text-emerald-200 border-emerald-400 shadow-[0_0_10px_rgba(16,185,129,0.3)]'
+                          : 'bg-slate-800/60 text-slate-400 border-slate-700 hover:text-slate-200'
+                      }`}
+                    >
+                      <Calendar className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                      <span>{isKu ? 'ڕۆژانە' : isAr ? '📅 يومياً' : 'Daily'}</span>
+                    </button>
+                  </div>
+                </div>
+
+                {/* 2. Destination / Storage Mode */}
+                <div className="p-3.5 rounded-xl bg-slate-900/80 border border-slate-700/60 flex flex-col justify-between gap-2.5">
+                  <label className="text-xs font-bold text-slate-200 flex items-center gap-1.5">
+                    <HardDrive className="w-4 h-4 text-emerald-400" />
+                    <span>{isKu ? 'شوێنی هەڵگرتن:' : isAr ? 'طريقة الحفظ والتنزيل:' : 'Backup Destination:'}</span>
+                  </label>
+
+                  <div className="grid grid-cols-3 gap-1">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setSettings(prev => ({
+                          ...prev,
+                          autoBackupDestination: 'local_archive'
+                        }))
+                      }
+                      className={`px-1.5 py-2 rounded-lg text-[11px] font-bold text-center transition-all border ${
+                        settings.autoBackupDestination === 'local_archive'
+                          ? 'bg-emerald-600/30 text-emerald-200 border-emerald-400 shadow-sm'
+                          : 'bg-slate-800/60 text-slate-400 border-slate-700 hover:text-slate-200'
+                      }`}
+                      title="حفظ تلقائي صامت في أرشيف الذاكرة بدون فتح نوافذ تنزيل"
+                    >
+                      {isKu ? 'ئەرشیفی ناوخۆ' : isAr ? '📁 أرشيف محلي' : 'Local'}
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setSettings(prev => ({
+                          ...prev,
+                          autoBackupDestination: 'auto_download'
+                        }))
+                      }
+                      className={`px-1.5 py-2 rounded-lg text-[11px] font-bold text-center transition-all border ${
+                        settings.autoBackupDestination === 'auto_download'
+                          ? 'bg-cyan-600/30 text-cyan-200 border-cyan-400 shadow-sm'
+                          : 'bg-slate-800/60 text-slate-400 border-slate-700 hover:text-slate-200'
+                      }`}
+                      title="تنزيل ملف .json تلقائياً إلى مجلد التنزيلات"
+                    >
+                      {isKu ? 'داگرتنی فایل' : isAr ? '💾 تنزيل ملف' : 'Download'}
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setSettings(prev => ({
+                          ...prev,
+                          autoBackupDestination: 'both'
+                        }))
+                      }
+                      className={`px-1.5 py-2 rounded-lg text-[11px] font-bold text-center transition-all border ${
+                        settings.autoBackupDestination === 'both' || !settings.autoBackupDestination
+                          ? 'bg-purple-600/30 text-purple-200 border-purple-400 shadow-sm'
+                          : 'bg-slate-800/60 text-slate-400 border-slate-700 hover:text-slate-200'
+                      }`}
+                      title="حفظ في الأرشيف المحلي وتنزيل ملف معاً"
+                    >
+                      {isKu ? 'هەردووکیان' : isAr ? '🔄 كلاهما معاً' : 'Both'}
+                    </button>
+                  </div>
+                </div>
+
+                {/* 3. Live Countdown & Status Box */}
+                <div className="p-3.5 rounded-xl bg-slate-900/80 border border-slate-700/60 flex flex-col justify-between gap-1.5">
+                  <div className="flex items-center justify-between text-xs font-bold text-slate-300">
+                    <span className="flex items-center gap-1 text-slate-400">
+                      <History className="w-3.5 h-3.5 text-cyan-400" />
+                      {isKu ? 'دواین کۆپیکردن:' : isAr ? 'آخر نسخة مأخوذة:' : 'Last Backup:'}
+                    </span>
+                    <span className="text-cyan-300 font-mono text-[11px]">
+                      {settings.lastAutoBackupTime
+                        ? formatBackupDateTime(settings.lastAutoBackupTime)
+                        : (isKu ? 'هێشتا نەگیراوە' : isAr ? 'لم تنفذ بعد' : 'Not yet')}
+                    </span>
+                  </div>
+
+                  <div className="flex items-center justify-between text-xs font-bold text-slate-300">
+                    <span className="flex items-center gap-1 text-slate-400">
+                      <Clock className="w-3.5 h-3.5 text-emerald-400" />
+                      {isKu ? 'کۆپیکردنی داهاتوو:' : isAr ? 'النسخة القادمة:' : 'Next Backup:'}
+                    </span>
+                    <span className="text-emerald-300 text-[11px] font-bold">
+                      {getTimeRemainingUntilNextBackup(settings, isKu ? 'ku' : isAr ? 'ar' : 'en').text}
+                    </span>
+                  </div>
+
+                  <div className="pt-1 flex items-center justify-between text-[11px] text-slate-400 border-t border-slate-800">
+                    <span className="flex items-center gap-1 text-emerald-400 font-semibold">
+                      <Shield className="w-3 h-3" />
+                      {isKu ? 'کارکردنی ئۆفلاین ١٠٠٪' : isAr ? 'أوفلاين 100% بدون إنترنت' : '100% Offline Capable'}
+                    </span>
+                    <span className="text-slate-400">
+                      {backupSnapshots.length} {isKu ? 'کۆپی لە ئەرشیف' : isAr ? 'نسخ محفوظة' : 'snapshots'}
+                    </span>
+                  </div>
+                </div>
+
+              </div>
+
+              {/* Archived Snapshots Table & History Area */}
+              <div className="mt-4 pt-3 border-t border-slate-800/80">
+                <div className="flex items-center justify-between mb-2.5">
+                  <div className="flex items-center gap-2">
+                    <History className="w-4 h-4 text-cyan-400" />
+                    <span className="text-xs font-black text-slate-200">
+                      {isKu ? 'سجلی کۆپییە یەدەگە هەڵگیراوەکان (Snapshots Archive):' : isAr ? 'سجل أرشيف النسخ الاحتياطية المحفوظة محلياً للرجوع إليها:' : 'Saved Backup Snapshots Archive:'}
+                    </span>
+                  </div>
+                  {backupSnapshots.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        const ok = window.confirm(
+                          isKu ? 'دڵنیایت لە پاککردنەوەی هەموو ئەرشیفی کۆپییە یەدەگەکان؟' : isAr ? 'هل أنت متأكد من مسح جميع النسخ المحفوظة في الأرشيف؟' : 'Clear all archived snapshots?'
+                        );
+                        if (!ok) return;
+                        await clearAllBackupSnapshots();
+                        await loadSnapshots();
+                      }}
+                      className="text-[10px] text-slate-400 hover:text-rose-400 font-bold flex items-center gap-1 transition-colors"
+                    >
+                      <Trash2 className="w-3 h-3" />
+                      <span>{isKu ? 'سڕینەوەی هەموو ئەرشیف' : isAr ? 'مسح الأرشيف' : 'Clear Archive'}</span>
+                    </button>
+                  )}
+                </div>
+
+                {isLoadingSnapshots ? (
+                  <div className="py-6 text-center text-xs text-slate-400 flex items-center justify-center gap-2">
+                    <RefreshCw className="w-4 h-4 animate-spin text-cyan-400" />
+                    <span>{isAr ? 'جاري قراءة سجل النسخ...' : 'Loading snapshots...'}</span>
+                  </div>
+                ) : backupSnapshots.length === 0 ? (
+                  <div className="py-4 px-3 rounded-xl bg-slate-900/50 border border-slate-800 text-center">
+                    <p className="text-xs text-slate-400 font-medium">
+                      {isKu
+                        ? 'تا ئێستا هیچ کۆپییەک تۆمار نەکراوە. دەتوانیت دوگمەی "کۆپیکردنی یەدەگ ئێستا" دابگریت.'
+                        : isAr
+                        ? 'لم يتم إنشاء نسخ احتياطية حتى الآن. انقر على زر "أخذ نسخة احتياطية الآن" لإنشاء أول لقطة فوراً.'
+                        : 'No backup snapshots found yet. Click "Backup Now" above to create your first snapshot.'}
+                    </p>
+                  </div>
+                ) : (
+                  <div className="overflow-x-auto custom-scrollbar max-h-56">
+                    <table className="w-full text-right rtl:text-right ltr:text-left text-xs">
+                      <thead>
+                        <tr className="bg-slate-900/90 text-slate-400 border-b border-slate-800 text-[11px]">
+                          <th className="py-2 px-3">{isKu ? 'بەروار و کات' : isAr ? 'التاريخ والوقت' : 'Timestamp'}</th>
+                          <th className="py-2 px-3">{isKu ? 'جۆر' : isAr ? 'النوع' : 'Type'}</th>
+                          <th className="py-2 px-3">{isKu ? 'ناوەڕۆک' : isAr ? 'محتويات النسخة' : 'Contents'}</th>
+                          <th className="py-2 px-3">{isKu ? 'قەبارە' : isAr ? 'الحجم' : 'Size'}</th>
+                          <th className="py-2 px-3 text-center">{isKu ? 'کردارەکان' : isAr ? 'إجراءات النسخة' : 'Actions'}</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-800/60">
+                        {backupSnapshots.map((snap) => (
+                          <tr key={snap.id} className="hover:bg-cyan-950/20 transition-colors">
+                            <td className="py-2 px-3 font-mono text-cyan-200 text-[11px]">
+                              {snap.formattedDate}
+                            </td>
+                            <td className="py-2 px-3">
+                              <span className={`px-2 py-0.5 rounded-md text-[10px] font-bold border ${
+                                snap.triggerType === 'hourly'
+                                  ? 'bg-cyan-500/20 text-cyan-300 border-cyan-500/30'
+                                  : snap.triggerType === 'daily'
+                                  ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30'
+                                  : 'bg-amber-500/20 text-amber-300 border-amber-500/30'
+                              }`}>
+                                {snap.triggerType === 'hourly'
+                                  ? (isKu ? 'کاتژمێری' : isAr ? 'كل ساعة' : 'Hourly')
+                                  : snap.triggerType === 'daily'
+                                  ? (isKu ? 'ڕۆژانە' : isAr ? 'يومياً' : 'Daily')
+                                  : (isKu ? 'دەستی' : isAr ? 'يدوي' : 'Manual')}
+                              </span>
+                            </td>
+                            <td className="py-2 px-3 text-slate-300 text-[11px]">
+                              <span>{snap.itemsCount?.products || 0} {isKu ? 'کاڵا' : isAr ? 'مادة' : 'products'}</span>
+                              <span className="text-slate-500 mx-1">•</span>
+                              <span>{snap.itemsCount?.sales || 0} {isKu ? 'فرۆشتن' : isAr ? 'مبيعات' : 'sales'}</span>
+                              <span className="text-slate-500 mx-1">•</span>
+                              <span>{snap.itemsCount?.purchases || 0} {isKu ? 'کڕین' : isAr ? 'مشتريات' : 'purchases'}</span>
+                            </td>
+                            <td className="py-2 px-3 text-slate-400 font-mono text-[10px]">
+                              {snap.sizeBytes ? `${Math.round(snap.sizeBytes / 1024)} KB` : '-'}
+                            </td>
+                            <td className="py-2 px-3">
+                              <div className="flex items-center justify-center gap-1.5">
+                                {/* Restore Snapshot Button */}
+                                <button
+                                  type="button"
+                                  onClick={() => setSnapshotToRestore(snap)}
+                                  className="px-2 py-1 rounded-lg bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 border border-emerald-500/30 text-[10px] font-bold flex items-center gap-1 transition-all"
+                                  title={isKu ? 'گەڕاندنەوەی ئەم کۆپییە بۆ ناو سیستم' : isAr ? 'استعادة كافة بيانات هذه النسخة فوراً' : 'Restore this snapshot'}
+                                >
+                                  <RefreshCw className="w-3 h-3" />
+                                  <span>{isKu ? 'گەڕاندنەوە' : isAr ? 'استعادة' : 'Restore'}</span>
+                                </button>
+
+                                {/* Download File Button */}
+                                <button
+                                  type="button"
+                                  onClick={() => downloadBackupSnapshot(snap.id)}
+                                  className="px-2 py-1 rounded-lg bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-300 border border-cyan-500/30 text-[10px] font-bold flex items-center gap-1 transition-all"
+                                  title={isKu ? 'داگرتنی وەک فایلی JSON بۆ کۆمپیوتەر' : isAr ? 'تنزيل كملف JSON للجهاز' : 'Download JSON file'}
+                                >
+                                  <Download className="w-3 h-3" />
+                                  <span>{isKu ? 'داگرتن' : isAr ? 'تنزيل' : 'Download'}</span>
+                                </button>
+
+                                {/* Delete Snapshot Button */}
+                                <button
+                                  type="button"
+                                  onClick={() => handleDeleteSnapshotItem(snap.id)}
+                                  className="p-1 rounded-lg bg-rose-500/10 hover:bg-rose-500/20 text-rose-400 border border-rose-500/20 text-[10px] transition-all"
+                                  title={isKu ? 'سڕینەوە' : isAr ? 'حذف من الأرشيف' : 'Delete'}
+                                >
+                                  <Trash2 className="w-3 h-3" />
+                                </button>
+                              </div>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+
+            </div>
+
+            {/* Modal for Confirming Snapshot Restoration */}
+            {snapshotToRestore && (
+              <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-in fade-in">
+                <div className="w-full max-w-md p-5 rounded-2xl bg-[#0B1120] border border-cyan-500/50 shadow-[0_0_30px_rgba(6,182,212,0.3)] text-white">
+                  <div className="flex items-center gap-3 border-b border-cyan-500/20 pb-3">
+                    <div className="p-2.5 rounded-xl bg-cyan-500/20 text-cyan-300 border border-cyan-500/40">
+                      <RefreshCw className="w-5 h-5" />
+                    </div>
+                    <div>
+                      <h4 className="text-sm font-black text-white">
+                        {isKu ? 'دڵنیابوونەوە لە گەڕاندنەوەی کۆپیی یەدەگ' : isAr ? 'تأكيد استعادة النسخة الاحتياطية' : 'Confirm Snapshot Restore'}
+                      </h4>
+                      <p className="text-xs text-cyan-300 font-mono mt-0.5">{snapshotToRestore.formattedDate}</p>
+                    </div>
+                  </div>
+
+                  <div className="my-4 p-3 rounded-xl bg-slate-900/90 border border-slate-800 text-xs space-y-2">
+                    <p className="text-slate-300">
+                      {isKu
+                        ? 'ئایا دڵنیایت لە گەڕاندنەوەی داتاکانی ئەم کۆپییە؟ داتاکانی ئێستا بە داتاکانی ئەم کاتە دەگۆڕدرێنەوە:'
+                        : isAr
+                        ? 'هل أنت متأكد من استعادة كافة بيانات هذه النسخة؟ سيتم تحديث وتثبيت البيانات التالية مباشرة في المنظومة:'
+                        : 'Are you sure you want to restore this snapshot? The following records will be loaded:'}
+                    </p>
+                    <div className="grid grid-cols-2 gap-2 pt-1 font-bold text-cyan-200">
+                      <div className="p-2 rounded-lg bg-slate-800/60 border border-slate-700">
+                        📦 {snapshotToRestore.itemsCount?.products || 0} {isKu ? 'کاڵا' : isAr ? 'مادة في المخزن' : 'Products'}
+                      </div>
+                      <div className="p-2 rounded-lg bg-slate-800/60 border border-slate-700">
+                        🧾 {snapshotToRestore.itemsCount?.sales || 0} {isKu ? 'فرۆشتن' : isAr ? 'عملية بيع' : 'Sales'}
+                      </div>
+                      <div className="p-2 rounded-lg bg-slate-800/60 border border-slate-700">
+                        🚚 {snapshotToRestore.itemsCount?.suppliers || 0} {isKu ? 'دابینکەر' : isAr ? 'مورد' : 'Suppliers'}
+                      </div>
+                      <div className="p-2 rounded-lg bg-slate-800/60 border border-slate-700">
+                        👥 {snapshotToRestore.itemsCount?.customers || 0} {isKu ? 'کڕیار' : isAr ? 'عميل' : 'Customers'}
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center justify-end gap-2 pt-2">
+                    <button
+                      type="button"
+                      onClick={() => setSnapshotToRestore(null)}
+                      disabled={isRestoringSnapshot}
+                      className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 font-bold text-xs cursor-pointer"
+                    >
+                      {isKu ? 'پاشگەزبوونەوە' : isAr ? 'إلغاء' : 'Cancel'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleConfirmRestoreSnapshot(snapshotToRestore)}
+                      disabled={isRestoringSnapshot}
+                      className="px-5 py-2 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white font-black text-xs flex items-center gap-1.5 shadow-[0_0_15px_rgba(16,185,129,0.3)] cursor-pointer disabled:opacity-50"
+                    >
+                      {isRestoringSnapshot ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Check className="w-4 h-4" />}
+                      <span>{isRestoringSnapshot ? (isAr ? 'جاري الاستعادة...' : 'Restoring...') : (isKu ? 'بەڵێ، گەڕاندنەوە' : isAr ? 'نعم، استعادة الآن' : 'Yes, Restore')}</span>
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Factory Reset & Clean Store Preparation for New Client (تهيئة المنظومة لعميل جديد) */}
+            <div className="mt-4 p-4 rounded-2xl bg-gradient-to-r from-rose-950/60 via-red-950/40 to-slate-900/80 border border-rose-500/40 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 shadow-lg">
+              <div className="flex items-start gap-3">
+                <div className="p-3 rounded-2xl bg-rose-500/20 text-rose-300 border border-rose-500/40 shrink-0">
+                  <Trash2 className="w-6 h-6 text-rose-400" />
+                </div>
+                <div>
+                  <h4 className="text-sm font-black text-white flex items-center gap-2">
+                    <span>{isKu ? 'ئامادەکردنی سیستم بۆ کڕیاری نوێ (تەسفیرکردنی داتا)' : isAr ? 'تهيئة المنظومة لعميل جديد (تصفير شامل لكافة البيانات)' : 'Factory Reset for New Client'}</span>
+                    <span className="px-2 py-0.5 rounded-full bg-rose-500/20 text-rose-300 text-[10px] font-mono font-bold border border-rose-500/30">
+                      {isKu ? 'پاککردنەوەی گشتی' : isAr ? 'تصفير فوري' : 'Clean Slate'}
+                    </span>
+                  </h4>
+                  <p className="text-xs text-rose-200/80 mt-1 max-w-xl leading-relaxed">
+                    {isKu
+                      ? 'سڕینەوەی تەواوی کاڵاکان، فرۆشتنەکان، کڕینەکان، قەرزەکان، و مێژووی سندوق و ئامادەکردنی وەک بەرنامەیەکی نوێ بە تەواوی بۆ کڕیار بە هەژماری Admin (PIN: 123).'
+                      : isAr
+                      ? 'مسح كامل سجلات المواد، المبيعات، الفواتير، المشتريات، ديون العملاء، حركات الصندوق، والمصاريف لتسليم البرنامج نظيفاً وجديداً تماماً للعميل مع حساب المدير الافتراضي (رمز الدخول: 123).'
+                      : 'Wipes all products, sales, purchases, debts, expenses, and cash drawer history to deliver a pristine clean system to a new client with default Admin (PIN: 123).'}
+                  </p>
+                </div>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => setIsResetConfirmOpen(true)}
+                className="w-full sm:w-auto px-5 py-3 rounded-xl bg-gradient-to-r from-rose-600 to-red-700 hover:from-rose-500 hover:to-red-600 text-white font-black text-xs flex items-center justify-center gap-2 shadow-[0_0_20px_rgba(225,29,72,0.4)] active:scale-95 transition-all cursor-pointer shrink-0 border border-rose-400/40"
+              >
+                <Trash2 className="w-4 h-4 text-rose-100" />
+                <span>{isKu ? 'تەسفیرکردنی گشتی و دەستپێکی نوێ' : isAr ? 'تصفير المنظومة لعميل جديد' : 'Factory Reset System'}</span>
+              </button>
+            </div>
+
+          </div>
+        </div>
+
+      </div>
+
+      {/* Factory Reset Confirmation Modal */}
+      {isResetConfirmOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-md animate-fadeIn select-none">
+          <div className="relative w-full max-w-lg bg-[#090F1E] border-2 border-rose-500/60 rounded-3xl p-6 sm:p-7 shadow-[0_0_50px_rgba(225,29,72,0.4)] space-y-5 text-center">
+            
+            <div className="w-16 h-16 mx-auto rounded-3xl bg-rose-500/20 text-rose-400 border border-rose-500/40 flex items-center justify-center shadow-lg animate-bounce">
+              <AlertTriangle className="w-8 h-8" />
+            </div>
+
+            <div className="space-y-2">
+              <h3 className="text-lg sm:text-xl font-black text-white">
+                {isKu ? 'ئایا دڵنیایت لە تەسفیرکردنی تەواوی سیستم؟' : isAr ? 'هل أنت متأكد من تصفير وتهيئة المنظومة بالكامل؟' : 'Confirm Complete Factory Reset?'}
+              </h3>
+              <p className="text-xs sm:text-sm text-slate-300 leading-relaxed px-2">
+                {isKu
+                  ? 'ئەم کارە هەموو کاڵاکان، نرخەکان، مێژووی فرۆشتنەکان، کڕین، قەرز، و هەموو ڕاپۆرتەکان دەسڕێتەوە و سیستم دەکاتە خاڵی و نوێ بۆ کڕیار. هەژماری چوونەژوورەوەی پێشوەختە دەبێتە: admin بە ڕەمزی (123).'
+                  : isAr
+                  ? 'سيتم مسح كافة المواد، الأسعار، المبيعات السابقة، فواتير الشراء، ديون العملاء، وحركات الصندوق بالكامل، لتصبح المنظومة خالية وجديدة 100% وجاهزة لبدء العمل من قِبل العميل. الحساب الافتراضي للدخول سيكون: admin برمز (123).'
+                  : 'This will delete all products, transactions, debts, purchases, and cash history to leave the app 100% empty and ready for a new client. Default login credentials will be: admin with PIN (123).'}
+              </p>
+            </div>
+
+            <div className="p-3.5 rounded-2xl bg-rose-950/40 border border-rose-500/30 text-rose-300 text-xs font-bold flex items-center justify-center gap-2">
+              <Lock className="w-4 h-4 shrink-0" />
+              <span>{isKu ? 'دوای تەسفیرکردن، پەڕەی چوونەژوورەوە دەکرێتەوە و داوای PIN دەکات' : isAr ? 'بعد التصفير، سيطلب البرنامج رمز الدخول فوراً' : 'After reset, the program will prompt for login PIN'}</span>
+            </div>
+
+            <div className="grid grid-cols-2 gap-3 pt-2">
+              <button
+                type="button"
+                onClick={() => setIsResetConfirmOpen(false)}
+                disabled={isResetting}
+                className="py-3 px-4 rounded-2xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs sm:text-sm font-bold transition-all cursor-pointer"
+              >
+                {isKu ? 'پاشگەزبوونەوە' : isAr ? 'إلغاء والتراجع' : 'Cancel'}
+              </button>
+
+              <button
+                type="button"
+                disabled={isResetting}
+                onClick={async () => {
+                  setIsResetting(true);
+                  if (onFactoryReset) {
+                    await onFactoryReset();
+                  }
+                  setIsResetting(false);
+                  setIsResetConfirmOpen(false);
+                }}
+                className="py-3 px-4 rounded-2xl bg-gradient-to-r from-rose-600 to-red-700 hover:from-rose-500 hover:to-red-600 text-white text-xs sm:text-sm font-black transition-all shadow-lg shadow-rose-600/40 cursor-pointer active:scale-95 flex items-center justify-center gap-2"
+              >
+                {isResetting ? (
+                  <>
+                    <RefreshCw className="w-4 h-4 animate-spin" />
+                    <span>{isKu ? 'سڕینەوە...' : isAr ? 'جاري التصفير...' : 'Resetting...'}</span>
+                  </>
+                ) : (
+                  <>
+                    <Trash2 className="w-4 h-4" />
+                    <span>{isKu ? 'بەڵێ، تەسفیری بکە' : isAr ? 'نعم، تصفير شامل الآن' : 'Yes, Factory Reset'}</span>
+                  </>
+                )}
+              </button>
+            </div>
+
+          </div>
+        </div>
+      )}
+
+      {/* POS Keyboard Shortcuts Modal */}
+      <KeyboardShortcutsModal
+        isOpen={isShortcutsModalOpen}
+        onClose={() => setIsShortcutsModalOpen(false)}
+        settings={settings}
+        setSettings={setSettings}
+      />
+
+      {/* High-Capacity Local Database & Storage Engine Modal */}
+      <DatabaseStorageModal
+        isOpen={isDbStorageModalOpen}
+        onClose={() => setIsDbStorageModalOpen(false)}
+        settings={settings}
+        onDataRestored={() => {
+          window.location.reload();
+        }}
+      />
+
+      {/* Stress Testing & Mass Data Generator Modal */}
+      <StressTestDataModal
+        isOpen={isStressTestModalOpen}
+        onClose={() => setIsStressTestModalOpen(false)}
+        settings={settings}
+        onDataLoaded={(data) => {
+          if (onImportBackup) {
+            onImportBackup(data);
+          }
+          setImportStatus(isKu ? `✅ بە سەرکەوتوویی داتاکان (${data.products.length} کاڵا، ${data.salesHistory.length} فرۆشتن) بارکران!` : isAr ? `✅ تم توليد وشحن البيانات بنجاح (${data.products.length.toLocaleString()} مادة، ${data.salesHistory.length.toLocaleString()} حركة بيع)!` : 'Stress test data loaded successfully!');
+          setIsStressTestModalOpen(false);
+        }}
+      />
+
+      {/* Google Drive Cloud Backup Modal */}
+      <GoogleDriveBackupModal
+        isOpen={isGoogleDriveModalOpen}
+        onClose={() => setIsGoogleDriveModalOpen(false)}
+        settings={settings}
+        products={products}
+        salesHistory={salesHistory}
+        suppliers={suppliers}
+        customers={customers}
+        orders={orders}
+        notifications={notifications}
+        purchaseInvoices={purchaseInvoices}
+        userAccounts={userAccounts}
+        onImportBackup={onImportBackup}
+      />
+
+      {/* Kiosk / Silent POS Printing Modal */}
+      <KioskPrintModal
+        isOpen={isKioskModalOpen}
+        onClose={() => setIsKioskModalOpen(false)}
+        lang={settings.language}
+        settings={settings}
+      />
+
+    </div>
+  );
+};

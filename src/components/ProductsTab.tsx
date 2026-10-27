@@ -1,0 +1,1977 @@
+import React, { useState, useRef, useEffect, useMemo, useDeferredValue } from 'react';
+import { 
+  Package, 
+  Search, 
+  Plus, 
+  Filter, 
+  Edit3, 
+  Trash2, 
+  AlertTriangle, 
+  Barcode as BarcodeIcon, 
+  LayoutGrid, 
+  List, 
+  Calendar,
+  Layers,
+  Sparkles,
+  Calculator,
+  UserCheck,
+  LayoutDashboard,
+  ClipboardCheck,
+  FileSpreadsheet,
+  Printer,
+  Upload,
+  CheckCircle2,
+  Receipt,
+  ChevronLeft,
+  ChevronRight,
+  ChevronsLeft,
+  ChevronsRight,
+  X,
+  Clock,
+  ShieldAlert,
+  Monitor
+} from 'lucide-react';
+import { Product, Category, StoreSettings, UserAccount } from '../types';
+import { formatNumber } from '../lib/formatUtils';
+import { getSavedCategories } from './ProductModal';
+import { PriceHistoryTooltip } from './PriceHistoryTooltip';
+import { InventoryAuditView } from './InventoryAuditView';
+import { ExpiryManagementView } from './ExpiryManagementView';
+import { exportProductsToExcel, parseExcelBackupFile } from '../lib/excelExport';
+import { syncBulkWriteCollection } from '../lib/firestoreSync';
+import { FastSearchInput } from './FastSearchInput';
+import { parseDate } from '../lib/dateUtils';
+import { findBestFuzzyProductMatch } from '../lib/fuzzyMatching';
+
+interface ProductsTabProps {
+  products: Product[];
+  setProducts: React.Dispatch<React.SetStateAction<Product[]>>;
+  settings: StoreSettings;
+  currentUser?: UserAccount | null;
+  onOpenAddModal: () => void;
+  onEditProduct: (product: Product) => void;
+  onBackToDashboard?: () => void;
+  onOpenPrintBarcode?: (product?: Product) => void;
+  onOpenInventoryAudit?: () => void;
+  onOpenDamagedItems?: () => void;
+  onOpenInvoices?: () => void;
+  onNavigateToReports?: () => void;
+  onOpenAIInvoiceScanner?: () => void;
+  onOpenLegacyScreenMigrator?: () => void;
+}
+
+const CATEGORIES = [
+  'الألبان والحليب',
+  'المشروبات والقهوة',
+  'السلع والحلويات',
+  'المخبوزات والخبز',
+  'اللحوم والدواجن',
+  'الخضار والفواكه',
+  'الأغذية المجمدة',
+  'المعلبات والزيوت',
+  'المنظفات والعناية',
+];
+
+export const ProductsTab: React.FC<ProductsTabProps> = ({
+  products,
+  setProducts,
+  settings,
+  currentUser,
+  onOpenAddModal,
+  onEditProduct,
+  onBackToDashboard,
+  onOpenPrintBarcode,
+  onOpenInventoryAudit,
+  onOpenDamagedItems,
+  onOpenInvoices,
+  onNavigateToReports,
+  onOpenAIInvoiceScanner,
+  onOpenLegacyScreenMigrator,
+}) => {
+  const lang = settings.language;
+  const isAr = lang === 'ar';
+  const isKu = lang === 'ku';
+  const t = (ar: string, ku: string, en: string) => isKu ? ku : isAr ? ar : en;
+
+  // Granular Permission Computations
+  const isAdmin = !currentUser || currentUser.role === 'Admin';
+  const perms = currentUser?.permissions;
+  const isCashier = Boolean(currentUser && currentUser.role === 'Cashier');
+  
+  // Can edit/delete or add products
+  const canEditProducts = isAdmin || (currentUser.role === 'Manager' && Boolean(perms?.canManageProducts));
+  
+  // Can view cost/purchase price and calculate profits (Cashiers without explicit override CANNOT see cost prices)
+  const canViewPurchasePrice = isAdmin || (currentUser.role === 'Manager' && Boolean(perms?.canManageProducts)) || Boolean(perms?.canViewPurchasePriceInPOS);
+  
+  // Can run audit or log damaged items
+  const canManageAudit = isAdmin || Boolean(perms?.canManageInventoryAudit);
+  const canManageDamaged = isAdmin || Boolean(perms?.canManageProducts);
+  const canViewInvoices = isAdmin || Boolean(perms?.canViewInvoices ?? perms?.canManageOrders);
+
+  // Retain active subview in session so updates and hot reloads don't kick user out of their open warehouse view
+  const [activeSubView, setActiveSubView] = useState<'catalog' | 'stockStatus' | 'inventoryAudit' | 'expiryAlerts' | null>(() => {
+    try {
+      const saved = sessionStorage.getItem('supermarket_warehouse_subview');
+      if (saved === 'catalog' || saved === 'stockStatus' || saved === 'inventoryAudit' || saved === 'expiryAlerts') return saved;
+    } catch (e) {}
+    return null;
+  });
+
+  useEffect(() => {
+    try {
+      if (activeSubView) {
+        sessionStorage.setItem('supermarket_warehouse_subview', activeSubView);
+      } else {
+        sessionStorage.removeItem('supermarket_warehouse_subview');
+      }
+    } catch (e) {}
+  }, [activeSubView]);
+  const [search, setSearch] = useState('');
+  const [selectedCat, setSelectedCat] = useState<string>('ALL');
+  const [stockFilter, setStockFilter] = useState<'ALL' | 'IN_STOCK' | 'LOW' | 'OUT' | 'DEBT'>('ALL');
+  const [viewMode, setViewMode] = useState<'table' | 'grid'>('table');
+  const [showCategories, setShowCategories] = useState(false);
+  const [importBanner, setImportBanner] = useState<string>('');
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const [currentPage, setCurrentPage] = useState(1);
+  const [pageSize, setPageSize] = useState<number>(40);
+
+  const safeProducts = useMemo(() => Array.isArray(products) ? products.filter(Boolean) : [], [products]);
+
+  const categoriesList = useMemo(() => {
+    const saved = getSavedCategories();
+    const catsSet = new Set<string>(CATEGORIES);
+    for (let i = 0; i < saved.length; i++) catsSet.add(saved[i]);
+    for (let i = 0; i < safeProducts.length; i++) {
+      const cat = safeProducts[i]?.categoryAr || safeProducts[i]?.category;
+      if (cat) catsSet.add(cat);
+    }
+    return Array.from(catsSet);
+  }, [safeProducts]);
+
+  // Stats calculation memoized for high performance with 10k+ products
+  const { totalProductsCount, inStockCount, lowStockProducts, outOfStockProducts, debtStockProducts } = useMemo(() => {
+    let inStock = 0;
+    const lowStock: Product[] = [];
+    const outOfStock: Product[] = [];
+    const debtStock: Product[] = [];
+
+    for (let i = 0; i < safeProducts.length; i++) {
+      const p = safeProducts[i];
+      if (!p) continue;
+      const minStock = p.minStock ?? 5;
+      const currentStock = p.stock ?? 0;
+      if (currentStock > minStock) {
+        inStock++;
+      } else if (currentStock <= minStock && currentStock > 0) {
+        lowStock.push(p);
+      } else if (currentStock === 0) {
+        outOfStock.push(p);
+      } else if (currentStock < 0) {
+        debtStock.push(p);
+      }
+    }
+
+    return {
+      totalProductsCount: safeProducts.length,
+      inStockCount: inStock,
+      lowStockProducts: lowStock,
+      outOfStockProducts: outOfStock,
+      debtStockProducts: debtStock,
+    };
+  }, [safeProducts]);
+
+  // Expiry statistics calculation for quick badges & hub warnings - Optimized with date cache
+  const expiryStats = useMemo(() => {
+    let expiredCount = 0;
+    let nearExpiryCount = 0;
+    let totalWithExpiry = 0;
+    const now = new Date();
+    now.setHours(0, 0, 0, 0);
+    const nowTime = now.getTime();
+    const dayMs = 1000 * 60 * 60 * 24;
+    const dateCache = new Map<string, number>();
+
+    const getDaysFast = (dateStr: string): number => {
+      const cached = dateCache.get(dateStr);
+      if (cached !== undefined) return cached;
+      const expDate = parseDate(dateStr);
+      const days = Math.ceil((expDate.getTime() - nowTime) / dayMs);
+      dateCache.set(dateStr, days);
+      return days;
+    };
+
+    for (let i = 0; i < safeProducts.length; i++) {
+      const p = safeProducts[i];
+      if (!p) continue;
+
+      let hasExp = false;
+      let earliestDays: number | null = null;
+
+      if (Array.isArray(p.batches) && p.batches.length > 0) {
+        for (const b of p.batches) {
+          if (b.expiryDate && b.expiryDate.trim() !== '' && b.expiryDate !== 'N/A') {
+            hasExp = true;
+            const days = getDaysFast(b.expiryDate);
+            if (earliestDays === null || days < earliestDays) {
+              earliestDays = days;
+            }
+          }
+        }
+      }
+
+      if (earliestDays === null && p.expiryDate && p.expiryDate.trim() !== '' && p.expiryDate !== 'N/A') {
+        hasExp = true;
+        earliestDays = getDaysFast(p.expiryDate);
+      }
+
+      if (hasExp) {
+        totalWithExpiry++;
+        if (earliestDays !== null) {
+          if (earliestDays < 0) {
+            expiredCount++;
+          } else if (earliestDays <= 90) {
+            nearExpiryCount++;
+          }
+        }
+      }
+    }
+
+    return { expiredCount, nearExpiryCount, totalWithExpiry };
+  }, [safeProducts]);
+
+  const deferredSearch = useDeferredValue(search);
+
+  // Pre-indexed products & exact barcode map for ultra-fast (<1ms) search across 10,000+ items
+  const { indexedProducts, barcodeMap } = useMemo(() => {
+    const bMap = new Map<string, Product>();
+    const len = safeProducts.length;
+    const list = [];
+    for (let i = 0; i < len; i++) {
+      const p = safeProducts[i];
+      if (!p) continue;
+      const barcodeClean = (p.barcode || '').trim().toLowerCase();
+      const nameClean = (p.name || '').trim().toLowerCase();
+      const nameArClean = (p.nameAr || '').trim().toLowerCase();
+      const nameKuClean = (p.nameKu || '').trim().toLowerCase();
+      const sciClean = (p.scientificName || '').trim().toLowerCase();
+      const suppClean = (p.supplierDelegate || '').trim().toLowerCase();
+
+      if (barcodeClean) {
+        bMap.set(barcodeClean, p);
+      }
+
+      list.push({
+        product: p,
+        fullSearchStr: `${barcodeClean} ${nameClean} ${nameArClean} ${nameKuClean} ${sciClean} ${suppClean}`,
+        barcode: barcodeClean,
+        categoryAr: p.categoryAr,
+        category: p.category,
+        stock: p.stock ?? 0,
+        minStock: p.minStock ?? 5
+      });
+    }
+    return { indexedProducts: list, barcodeMap: bMap };
+  }, [safeProducts]);
+
+  // Reset to page 1 whenever filters change
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [deferredSearch, selectedCat, stockFilter]);
+
+  const filteredProducts = useMemo(() => {
+    const searchLower = deferredSearch.trim().toLowerCase();
+    if (!searchLower && selectedCat === 'ALL' && stockFilter === 'ALL') {
+      return products;
+    }
+
+    const isDigitsOnly = /^\d+$/.test(searchLower);
+
+    // Exact barcode match optimization for instant single-product retrieval
+    if (isDigitsOnly && searchLower.length >= 3 && selectedCat === 'ALL' && stockFilter === 'ALL') {
+      const exactMatch = barcodeMap.get(searchLower);
+      if (exactMatch) {
+        const result: Product[] = [exactMatch];
+        const len = indexedProducts.length;
+        for (let i = 0; i < len; i++) {
+          const item = indexedProducts[i];
+          if (item.product.id !== exactMatch.id && item.barcode.includes(searchLower)) {
+            result.push(item.product);
+          }
+        }
+        return result;
+      }
+    }
+
+    const result: Product[] = [];
+    const len = indexedProducts.length;
+
+    for (let i = 0; i < len; i++) {
+      const item = indexedProducts[i];
+
+      if (stockFilter !== 'ALL') {
+        if (stockFilter === 'IN_STOCK' && item.stock <= item.minStock) continue;
+        if (stockFilter === 'LOW' && !(item.stock <= item.minStock && item.stock > 0)) continue;
+        if (stockFilter === 'OUT' && item.stock !== 0) continue;
+        if (stockFilter === 'DEBT' && item.stock >= 0) continue;
+      }
+
+      if (selectedCat !== 'ALL') {
+        const matchesCat = item.categoryAr === selectedCat || item.category === selectedCat;
+        if (!matchesCat) continue;
+      }
+
+      if (searchLower) {
+        if (isDigitsOnly) {
+          if (!item.barcode.includes(searchLower)) continue;
+        } else {
+          if (!item.fullSearchStr.includes(searchLower)) continue;
+        }
+      }
+
+      result.push(item.product);
+    }
+    return result;
+  }, [products, indexedProducts, barcodeMap, deferredSearch, selectedCat, stockFilter]);
+
+  const totalPages = Math.max(1, Math.ceil(filteredProducts.length / pageSize));
+  const safeCurrentPage = Math.min(Math.max(1, currentPage), totalPages);
+
+  const paginatedProducts = useMemo(() => {
+    const startIndex = (safeCurrentPage - 1) * pageSize;
+    return filteredProducts.slice(startIndex, startIndex + pageSize);
+  }, [filteredProducts, safeCurrentPage, pageSize]);
+
+  const renderPagination = () => {
+    if (filteredProducts.length === 0) return null;
+    const startIdx = (safeCurrentPage - 1) * pageSize + 1;
+    const endIdx = Math.min(safeCurrentPage * pageSize, filteredProducts.length);
+
+    return (
+      <div className={`flex flex-wrap items-center justify-between gap-3 p-3 rounded-2xl border transition-all ${
+        isLight
+          ? 'bg-white border-slate-200 shadow-sm text-slate-700'
+          : 'bg-[#090F1E] border-blue-500/20 shadow-md text-slate-300'
+      }`}>
+        {/* Count & Info */}
+        <div className="flex items-center gap-2 text-xs">
+          <span className="font-bold text-slate-900 dark:text-white">
+            {isAr
+              ? `عرض ${startIdx.toLocaleString('en-US')} - ${endIdx.toLocaleString('en-US')} من أصل ${filteredProducts.length.toLocaleString('en-US')} مادة`
+              : isKu
+              ? `پیشاندانی ${startIdx.toLocaleString('en-US')} - ${endIdx.toLocaleString('en-US')} لە کۆی ${filteredProducts.length.toLocaleString('en-US')} کاڵا`
+              : `Showing ${startIdx.toLocaleString('en-US')} - ${endIdx.toLocaleString('en-US')} of ${filteredProducts.length.toLocaleString('en-US')} products`}
+          </span>
+          {filteredProducts.length < products.length && (
+            <span className="text-[11px] text-amber-500 font-semibold">
+              ({isAr ? `تمت التصفية من ${products.length.toLocaleString('en-US')}` : isKu ? `فلتەرکراو لە ${products.length.toLocaleString('en-US')}` : `filtered from ${products.length.toLocaleString('en-US')}`})
+            </span>
+          )}
+        </div>
+
+        {/* Controls */}
+        <div className="flex flex-wrap items-center gap-2">
+          {/* Page size selector */}
+          <div className="flex items-center gap-1.5 text-xs">
+            <span className="text-[11px] text-slate-500 font-semibold">{isAr ? 'عدد السجلات:' : isKu ? 'ژمارە لە پەڕە:' : 'Per page:'}</span>
+            <select
+              value={pageSize}
+              onChange={(e) => {
+                setPageSize(Number(e.target.value));
+                setCurrentPage(1);
+              }}
+              className={`px-2.5 py-1 rounded-xl border text-xs font-bold focus:outline-none cursor-pointer ${
+                isLight
+                  ? 'bg-slate-50 border-slate-300 text-slate-800'
+                  : 'bg-slate-900 border-slate-700 text-cyan-300'
+              }`}
+            >
+              <option value={25}>25</option>
+              <option value={50}>50</option>
+              <option value={100}>100</option>
+              <option value={250}>250</option>
+              <option value={500}>500</option>
+              <option value={1000}>1000</option>
+            </select>
+          </div>
+
+          {totalPages > 1 && (
+            <>
+              {/* First Page */}
+              <button
+                type="button"
+                onClick={() => setCurrentPage(1)}
+                disabled={safeCurrentPage === 1}
+                className={`p-1.5 rounded-xl border text-xs font-bold transition-all flex items-center justify-center disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer ${
+                  isLight
+                    ? 'bg-slate-100 hover:bg-slate-200 text-slate-700 border-slate-300'
+                    : 'bg-slate-800 hover:bg-slate-700 text-slate-200 border-slate-700'
+                }`}
+                title={isAr ? 'الصفحة الأولى' : 'First Page'}
+              >
+                <ChevronsLeft className="w-4 h-4 rtl:rotate-180" />
+              </button>
+
+              {/* Prev Page */}
+              <button
+                type="button"
+                onClick={() => setCurrentPage(prev => Math.max(1, prev - 1))}
+                disabled={safeCurrentPage === 1}
+                className={`px-2.5 py-1 rounded-xl border text-xs font-bold transition-all flex items-center gap-1 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer ${
+                  isLight
+                    ? 'bg-slate-100 hover:bg-slate-200 text-slate-700 border-slate-300'
+                    : 'bg-slate-800 hover:bg-slate-700 text-slate-200 border-slate-700'
+                }`}
+              >
+                <ChevronLeft className="w-4 h-4 rtl:rotate-180" />
+                <span>{isAr ? 'السابق' : isKu ? 'پێشوو' : 'Prev'}</span>
+              </button>
+
+              {/* Current Page Display & Direct Jump */}
+              <div className="flex items-center gap-1 px-1">
+                <span className="text-xs text-slate-500 font-semibold">{isAr ? 'صفحة' : isKu ? 'پەڕە' : 'Page'}</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={totalPages}
+                  value={safeCurrentPage}
+                  onChange={(e) => {
+                    const val = parseInt(e.target.value, 10);
+                    if (!isNaN(val) && val >= 1 && val <= totalPages) {
+                      setCurrentPage(val);
+                    }
+                  }}
+                  className={`w-14 text-center py-0.5 rounded-lg border text-xs font-mono font-bold focus:outline-none ${
+                    isLight ? 'bg-white border-blue-400 text-blue-900' : 'bg-[#0B1120] border-cyan-500/50 text-cyan-300'
+                  }`}
+                />
+                <span className="text-xs text-slate-400 font-mono">/ {totalPages}</span>
+              </div>
+
+              {/* Next Page */}
+              <button
+                type="button"
+                onClick={() => setCurrentPage(prev => Math.min(totalPages, prev + 1))}
+                disabled={safeCurrentPage === totalPages}
+                className={`px-2.5 py-1 rounded-xl border text-xs font-bold transition-all flex items-center gap-1 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer ${
+                  isLight
+                    ? 'bg-slate-100 hover:bg-slate-200 text-slate-700 border-slate-300'
+                    : 'bg-slate-800 hover:bg-slate-700 text-slate-200 border-slate-700'
+                }`}
+              >
+                <span>{isAr ? 'التالي' : isKu ? 'دواتر' : 'Next'}</span>
+                <ChevronRight className="w-4 h-4 rtl:rotate-180" />
+              </button>
+
+              {/* Last Page */}
+              <button
+                type="button"
+                onClick={() => setCurrentPage(totalPages)}
+                disabled={safeCurrentPage === totalPages}
+                className={`p-1.5 rounded-xl border text-xs font-bold transition-all flex items-center justify-center disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer ${
+                  isLight
+                    ? 'bg-slate-100 hover:bg-slate-200 text-slate-700 border-slate-300'
+                    : 'bg-slate-800 hover:bg-slate-700 text-slate-200 border-slate-700'
+                }`}
+                title={isAr ? 'الصفحة الأخيرة' : 'Last Page'}
+              >
+                <ChevronsRight className="w-4 h-4 rtl:rotate-180" />
+              </button>
+            </>
+          )}
+        </div>
+      </div>
+    );
+  };
+
+  const handleDeleteProduct = (id: string) => {
+    if (confirm(isAr ? 'هل أنت متأكد من حذف هذه المادة؟' : isKu ? 'دڵنیایت لە سڕینەوەی ئەم کاڵایە؟' : 'Are you sure you want to delete this product?')) {
+      setProducts(prev => prev.filter(p => p.id !== id));
+    }
+  };
+
+  const handleStockAdjustment = (id: string, delta: number) => {
+    setProducts(prev => prev.map(p => {
+      if (p.id === id) {
+        const newCartons = Math.max(0, p.cartonsCount + delta);
+        const newTotalUnits = newCartons * p.unitsPerCarton;
+        const status = newTotalUnits === 0 ? 'out_of_stock' : newTotalUnits <= p.minStock ? 'low_stock' : 'in_stock';
+        return { 
+          ...p, 
+          cartonsCount: newCartons,
+          totalUnits: newTotalUnits,
+          stock: newTotalUnits, 
+          status 
+        };
+      }
+      return p;
+    }));
+  };
+
+  const isLight = settings.themeMode === 'light';
+
+  // 1. Initial State: Show the THREE main dedicated buttons/cards when opening Warehouse
+  if (activeSubView === null) {
+    return (
+      <div className="space-y-6 animate-fadeIn w-full max-w-6xl mx-auto py-4 px-2">
+        {/* Header Bar */}
+        <div className={`flex flex-wrap items-center justify-between gap-3 p-4 sm:p-5 rounded-2xl border transition-all duration-300 ${
+          isLight
+            ? 'bg-white border-slate-200 shadow-md text-slate-900'
+            : 'bg-[#10192D] border-blue-500/20 shadow-xl text-white'
+        }`}>
+          <div className="flex items-center gap-3">
+            {onBackToDashboard && (
+              <button
+                onClick={onBackToDashboard}
+                className={`px-3.5 py-2 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 border cursor-pointer shadow ${
+                  isLight
+                    ? 'bg-slate-100 hover:bg-slate-200 text-slate-700 border-slate-300'
+                    : 'bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border-slate-700'
+                }`}
+                title={t('الرجوع للقائمة الرئيسية', 'گەڕانەوە بۆ پێڕستی سەرەکی', 'Back to Main Menu')}
+              >
+                <LayoutDashboard className={`w-4 h-4 ${isLight ? 'text-blue-600' : 'text-cyan-400'}`} />
+                <span>{t('القائمة الرئيسية', 'پێڕستی سەرەکی', 'Main Menu')}</span>
+              </button>
+            )}
+
+            <div>
+              <h2 className={`text-base sm:text-lg font-black flex items-center gap-2 ${
+                isLight ? 'text-slate-900' : 'text-white'
+              }`}>
+                <Package className={`w-5 h-5 shrink-0 ${isLight ? 'text-blue-600' : 'text-cyan-400'}`} />
+                <span>{t('إدارة وأقسام المخزن', 'بەشەکانی کۆگا و کاڵاکان', 'Warehouse & Inventory Hub')}</span>
+              </h2>
+              <p className={`text-xs mt-0.5 ${isLight ? 'text-slate-500' : 'text-slate-400'}`}>
+                {t('يرجى اختيار القسم المطلوب للمتابعة والإدارة السريعة', 'تکایە بەشێک هەڵبژێرە بۆ بەڕێوەبردن و بەدواداچوونی خێرا', 'Please select a section to manage')}
+              </p>
+            </div>
+          </div>
+        </div>
+
+        {/* Dedicated Navigation Buttons / Cards Grid */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 sm:gap-4 pt-1">
+          
+          {/* Button: مسح وإدخال المواد بالذكاء الاصطناعي (AI Invoice Scanner) */}
+          {canEditProducts && onOpenAIInvoiceScanner && (
+            <button
+              type="button"
+              onClick={onOpenAIInvoiceScanner}
+              className={`group flex items-center gap-3.5 p-3.5 sm:p-4 rounded-2xl border-2 transition-all duration-200 text-left rtl:text-right cursor-pointer active:scale-[0.98] ${
+                isLight
+                  ? 'bg-gradient-to-r from-purple-50 via-fuchsia-50 to-indigo-50 border-purple-300 hover:border-purple-600 shadow-sm hover:shadow-md'
+                  : 'bg-gradient-to-r from-[#1E0E35] via-[#2A1348] to-[#140827] border-purple-500/50 hover:border-purple-400 hover:shadow-[0_0_30px_rgba(168,85,247,0.35)]'
+              }`}
+            >
+              <div className="w-12 h-12 rounded-xl bg-gradient-to-tr from-purple-600 via-fuchsia-500 to-indigo-600 flex items-center justify-center text-white shrink-0 shadow-lg group-hover:scale-105 transition-transform animate-pulse">
+                <Sparkles className="w-6 h-6 text-white stroke-[2.5]" />
+              </div>
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2">
+                  <span className={`text-sm sm:text-base font-black transition-colors ${
+                    isLight ? 'text-purple-950 group-hover:text-purple-700' : 'text-white group-hover:text-purple-300'
+                  }`}>
+                    {t('إدخال المواد عبر صورة الوصل (AI OCR)', 'خوێندنەوە و زیادکردنی مادەکان بە وێنەی پسوولە بە AI', 'AI Invoice Image Scanner')}
+                  </span>
+                  <span className="px-2.5 py-0.5 rounded-full bg-purple-500/20 text-purple-300 text-[10px] font-mono font-bold border border-purple-500/30">
+                    Gemini Vision
+                  </span>
+                </div>
+                <p className="text-[11px] text-slate-400 font-medium mt-0.5 truncate sm:whitespace-normal">
+                  {t(
+                    'التقط أو ارفع صورة وصل الشراء؛ يقوم النظام بقراءة أسماء الأدوية والمواد، التواريخ، وأسعار الشراء والبيع وحفظها فورياً',
+                    'وێنەی پسوولەکە دابنێ؛ ناوەکان، بەرواری بەسەرچوون، و نرخەکان بە تەواوی و خۆکار دەخرێنە کۆگاوە',
+                    'Snap or upload invoice photo: extracts items, batches, expiries & wholesale costs directly to warehouse'
+                  )}
+                </p>
+              </div>
+            </button>
+          )}
+
+          {/* Button: نقل المواد من شاشات البرامج السابقة (حتى 500 صورة دفعة واحدة) */}
+          {canEditProducts && onOpenLegacyScreenMigrator && (
+            <button
+              type="button"
+              onClick={onOpenLegacyScreenMigrator}
+              className={`group flex items-center gap-3.5 p-3.5 sm:p-4 rounded-2xl border-2 transition-all duration-200 text-left rtl:text-right cursor-pointer active:scale-[0.98] ${
+                isLight
+                  ? 'bg-gradient-to-r from-cyan-50 via-sky-50 to-blue-50 border-cyan-300 hover:border-cyan-600 shadow-sm hover:shadow-md'
+                  : 'bg-gradient-to-r from-[#071F2C] via-[#0B2E42] to-[#0A1D2E] border-cyan-500/50 hover:border-cyan-400 hover:shadow-[0_0_30px_rgba(6,182,212,0.35)]'
+              }`}
+            >
+              <div className="w-12 h-12 rounded-xl bg-gradient-to-tr from-cyan-500 via-teal-500 to-blue-600 flex items-center justify-center text-white shrink-0 shadow-lg group-hover:scale-105 transition-transform">
+                <Monitor className="w-6 h-6 text-white stroke-[2.5]" />
+              </div>
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2">
+                  <span className={`text-sm sm:text-base font-black transition-colors ${
+                    isLight ? 'text-cyan-950 group-hover:text-cyan-700' : 'text-white group-hover:text-cyan-300'
+                  }`}>
+                    {t('نقل المواد من صور البرنامج القديم (حتى 500 صورة)', 'هاوردەکردنی کاڵاکان لە وێنەی بەرنامەی کۆن (تا 500 وێنە)', 'Legacy System Screen Migrator (up to 500 images)')}
+                  </span>
+                  <span className="px-2.5 py-0.5 rounded-full bg-cyan-500/20 text-cyan-300 text-[10px] font-mono font-bold border border-cyan-500/30">
+                    {t('متعدد حتى 500', 'کۆمەڵ تا 500', 'Batch 500')}
+                  </span>
+                </div>
+                <p className="text-[11px] text-slate-400 font-medium mt-0.5 truncate sm:whitespace-normal">
+                  {t(
+                    'حدد صور شاشات برنامجك السابق (حتى 500 صورة)؛ يقوم النظام بقراءة الأسماء، الباركود، وأسعار الشيت والكرتون ونقلها دفعة واحدة',
+                    'تا 500 وێنەی شاشەی سیستەمە کۆنەکەت دیاریبکە؛ سیستمەکە بە یەکجار هەموو دەرمانەکان هاوردە دەکات',
+                    'Select up to 500 legacy screen photos: extracts barcodes, names, pack & blister prices in automated bulk batches'
+                  )}
+                </p>
+              </div>
+            </button>
+          )}
+
+          {/* Button 1: إدخال مادة جديدة (زیادکردنی کاڵای نوێ) - Only for Admins / Managers with edit rights */}
+          {canEditProducts && (
+            <button
+              type="button"
+              onClick={onOpenAddModal}
+              className={`group flex items-center gap-3.5 p-3.5 sm:p-4 rounded-2xl border-2 transition-all duration-200 text-left rtl:text-right cursor-pointer active:scale-[0.98] ${
+                isLight
+                  ? 'bg-white border-emerald-200 hover:border-emerald-500 shadow-sm hover:shadow-md'
+                  : 'bg-gradient-to-br from-[#061C14] to-[#0A2E21] border-emerald-500/40 hover:border-emerald-400 hover:shadow-[0_0_20px_rgba(16,185,129,0.25)]'
+              }`}
+            >
+              <div className="w-11 h-11 sm:w-12 sm:h-12 rounded-xl bg-gradient-to-tr from-emerald-500 to-teal-500 flex items-center justify-center text-white shrink-0 shadow-md group-hover:scale-105 transition-transform">
+                <Plus className="w-6 h-6 text-white stroke-[2.5]" />
+              </div>
+              <span className={`text-sm sm:text-base font-black transition-colors ${
+                isLight
+                  ? 'text-slate-900 group-hover:text-emerald-700'
+                  : 'text-white group-hover:text-emerald-300'
+              }`}>
+                {t('إدخال مادة جديدة', 'زیادکردنی کاڵای نوێ', 'New Product Entry')}
+              </span>
+            </button>
+          )}
+
+          {/* Button 2: دليل وسجل المواد والأسعار (ڕێبەری کاڵاکان و نرخەکان) */}
+          <button
+            type="button"
+            onClick={() => setActiveSubView('catalog')}
+            className={`group flex items-center gap-3.5 p-3.5 sm:p-4 rounded-2xl border-2 transition-all duration-200 text-left rtl:text-right cursor-pointer active:scale-[0.98] ${
+              isLight
+                ? 'bg-white border-blue-200 hover:border-blue-500 shadow-sm hover:shadow-md'
+                : 'bg-gradient-to-br from-[#0B1528] to-[#0F1D38] border-cyan-500/40 hover:border-cyan-400 hover:shadow-[0_0_20px_rgba(6,182,212,0.25)]'
+            }`}
+          >
+            <div className="w-11 h-11 sm:w-12 sm:h-12 rounded-xl bg-gradient-to-tr from-cyan-600 to-blue-500 flex items-center justify-center text-white shrink-0 shadow-md group-hover:scale-105 transition-transform">
+              <Package className="w-6 h-6 text-white" />
+            </div>
+            <span className={`text-sm sm:text-base font-black transition-colors ${
+              isLight
+                ? 'text-slate-900 group-hover:text-blue-700'
+                : 'text-white group-hover:text-cyan-300'
+            }`}>
+              {t('دليل وسجل المواد والأسعار', 'ڕێبەری کاڵاکان و نرخەکان', 'Products & Price Catalog')}
+            </span>
+          </button>
+
+          {/* Button 3: جرد وتدقيق المخزون الفعلي ومطابقة الأرصدة (پشکنین و جردی کۆگا) */}
+          {canManageAudit && (
+            <button
+              type="button"
+              onClick={() => setActiveSubView('inventoryAudit')}
+              className={`group flex items-center gap-3.5 p-3.5 sm:p-4 rounded-2xl border-2 transition-all duration-200 text-left rtl:text-right cursor-pointer active:scale-[0.98] ${
+                isLight
+                  ? 'bg-white border-amber-200 hover:border-amber-500 shadow-sm hover:shadow-md'
+                  : 'bg-gradient-to-br from-[#1A1208] to-[#25180B] border-amber-500/40 hover:border-amber-400 hover:shadow-[0_0_20px_rgba(245,158,11,0.25)]'
+              }`}
+            >
+              <div className="w-11 h-11 sm:w-12 sm:h-12 rounded-xl bg-gradient-to-tr from-amber-500 via-orange-600 to-amber-600 flex items-center justify-center text-white shrink-0 shadow-md group-hover:scale-105 transition-transform">
+                <ClipboardCheck className="w-6 h-6 text-white stroke-[2.2]" />
+              </div>
+              <div className="flex flex-col">
+                <span className={`text-sm sm:text-base font-black transition-colors ${
+                  isLight
+                    ? 'text-slate-900 group-hover:text-amber-700'
+                    : 'text-white group-hover:text-amber-300'
+                }`}>
+                  {t('جرد وتدقيق المخزون الفعلي', 'پشکنین و جردی کۆگا', 'Physical Inventory Audit')}
+                </span>
+                <span className="text-[11px] text-slate-400 font-semibold">
+                  {t('جرد الماركت والمستودع، كشف العجز، وتعديل الأرصدة', 'جردی مارکێت و کۆگا، دۆزینەوەی جیاوازی', 'Count market & storage, variance detection')}
+                </span>
+              </div>
+            </button>
+          )}
+
+          {/* Button 4: المواد المتبقية والنافذة - حالة المخزون (کاڵا ماوەکان و تەواوبووەکان) */}
+          <button
+            type="button"
+            onClick={() => setActiveSubView('stockStatus')}
+            className={`group flex items-center gap-3.5 p-3.5 sm:p-4 rounded-2xl border-2 transition-all duration-200 text-left rtl:text-right cursor-pointer active:scale-[0.98] ${
+              isLight
+                ? 'bg-white border-slate-200 hover:border-blue-500 shadow-sm hover:shadow-md'
+                : 'bg-gradient-to-br from-[#0B1220] to-[#121B30] border-blue-500/30 hover:border-cyan-400 hover:shadow-[0_0_20px_rgba(6,182,212,0.2)]'
+            }`}
+          >
+            <div className="w-11 h-11 sm:w-12 sm:h-12 rounded-xl bg-gradient-to-tr from-blue-600 to-cyan-600 flex items-center justify-center text-white shrink-0 shadow-md group-hover:scale-105 transition-transform">
+              <AlertTriangle className="w-6 h-6 text-white" />
+            </div>
+            <span className={`text-sm sm:text-base font-black transition-colors ${
+              isLight
+                ? 'text-slate-900 group-hover:text-blue-700'
+                : 'text-white group-hover:text-cyan-300'
+            }`}>
+              {t('المواد المتبقية والنافذة (حالة المخزون)', 'کاڵا ماوەکان و تەواوبووەکان (دۆخی کۆگا)', 'Stock Status')}
+            </span>
+          </button>
+
+          {/* Button 5: المواد المنتهية والصلاحيات (تتبع الصلاحية وانتهاء المدة) */}
+          <button
+            type="button"
+            onClick={() => setActiveSubView('expiryAlerts')}
+            className={`group flex items-center gap-3.5 p-3.5 sm:p-4 rounded-2xl border-2 transition-all duration-200 text-left rtl:text-right cursor-pointer active:scale-[0.98] ${
+              isLight
+                ? 'bg-white border-rose-200 hover:border-rose-500 shadow-sm hover:shadow-md'
+                : 'bg-gradient-to-br from-[#200A12] to-[#2E0F1A] border-rose-500/40 hover:border-rose-400 hover:shadow-[0_0_20px_rgba(244,63,94,0.25)]'
+            }`}
+          >
+            <div className="w-11 h-11 sm:w-12 sm:h-12 rounded-xl bg-gradient-to-tr from-rose-600 to-red-500 flex items-center justify-center text-white shrink-0 shadow-md group-hover:scale-105 transition-transform">
+              <Clock className="w-6 h-6 text-white stroke-[2.2]" />
+            </div>
+            <div className="flex flex-col flex-1 min-w-0">
+              <div className="flex items-center justify-between gap-1 flex-wrap">
+                <span className={`text-sm sm:text-base font-black transition-colors ${
+                  isLight
+                    ? 'text-slate-900 group-hover:text-rose-700'
+                    : 'text-white group-hover:text-rose-300'
+                }`}>
+                  {t('المواد المنتهية والصلاحيات', 'کاڵا بەسەرچووەکان و بەروار', 'Expiry & Expiration Management')}
+                </span>
+                {expiryStats.expiredCount > 0 && (
+                  <span className="px-2 py-0.5 rounded-full text-[10px] font-black font-mono bg-rose-600 text-white animate-pulse">
+                    {expiryStats.expiredCount} {t('منتهية', 'بەسەرچوو', 'expired')}
+                  </span>
+                )}
+              </div>
+              <span className="text-[11px] text-slate-400 font-semibold mt-0.5 truncate">
+                {expiryStats.nearExpiryCount > 0 
+                  ? t(`يوجد ${expiryStats.nearExpiryCount} مادة قريبة من الانتهاء (≤ 90 يوم)`, `${expiryStats.nearExpiryCount} کاڵا نزیکن لە بەسەرچوون`, `${expiryStats.nearExpiryCount} items near expiry (≤ 90d)`)
+                  : t('كشف المواد المنتهية، القريبة من الانتهاء، وتتبع الباتشات', 'چاودێری بەرواری بەسەرچوون و باچەکان', 'Track expired, near-expiry & batch items')
+                }
+              </span>
+            </div>
+          </button>
+
+          {/* Button 6: مواد متلفة ومكسورة ومنتهية (کاڵای تێکچوو و بەسەرچوو) */}
+          {canManageDamaged && (
+            <button
+              type="button"
+              onClick={onOpenDamagedItems}
+              className={`group flex items-center gap-3.5 p-3.5 sm:p-4 rounded-2xl border-2 transition-all duration-200 text-left rtl:text-right cursor-pointer active:scale-[0.98] ${
+                isLight
+                  ? 'bg-white border-rose-200 hover:border-rose-500 shadow-sm hover:shadow-md'
+                  : 'bg-gradient-to-br from-[#200A10] to-[#2D0F18] border-rose-500/40 hover:border-rose-400 hover:shadow-[0_0_20px_rgba(244,63,94,0.25)]'
+              }`}
+            >
+              <div className="w-11 h-11 sm:w-12 sm:h-12 rounded-xl bg-gradient-to-tr from-rose-500 to-red-600 flex items-center justify-center text-white shrink-0 shadow-md group-hover:scale-105 transition-transform">
+                <Trash2 className="w-6 h-6 text-white stroke-[2.2]" />
+              </div>
+              <span className={`text-sm sm:text-base font-black transition-colors ${
+                isLight
+                  ? 'text-slate-900 group-hover:text-rose-700'
+                  : 'text-white group-hover:text-rose-300'
+              }`}>
+                {t('مواد متلفة ومكسورة ومنتهية', 'کاڵای تێکچوو و بەسەرچوو', 'Damaged & Expired Items')}
+              </span>
+            </button>
+          )}
+
+          {/* Button 5: فواتير ومبيعات (پسوولە و فرۆشتنەکان) */}
+          {Boolean(onOpenInvoices && canViewInvoices) && (
+            <button
+              type="button"
+              onClick={onOpenInvoices}
+              className={`group flex items-center gap-3.5 p-3.5 sm:p-4 rounded-2xl border-2 transition-all duration-200 text-left rtl:text-right cursor-pointer active:scale-[0.98] ${
+                isLight
+                  ? 'bg-white border-teal-200 hover:border-teal-500 shadow-sm hover:shadow-md'
+                  : 'bg-gradient-to-br from-[#06181B] to-[#0A272B] border-teal-500/40 hover:border-teal-400 hover:shadow-[0_0_20px_rgba(20,184,166,0.25)]'
+              }`}
+            >
+              <div className="w-11 h-11 sm:w-12 sm:h-12 rounded-xl bg-gradient-to-tr from-teal-500 to-cyan-600 flex items-center justify-center text-white shrink-0 shadow-md group-hover:scale-105 transition-transform">
+                <Receipt className="w-6 h-6 text-white stroke-[2.2]" />
+              </div>
+              <span className={`text-sm sm:text-base font-black transition-colors ${
+                isLight
+                  ? 'text-slate-900 group-hover:text-teal-700'
+                  : 'text-white group-hover:text-teal-300'
+              }`}>
+                {t('فواتير ومبيعات', 'پسوولەکانی فرۆشتن', 'Invoices & Sales')}
+              </span>
+            </button>
+          )}
+
+        </div>
+      </div>
+    );
+  }
+
+  // 2. Render Selected View with Header & Return Option
+  return (
+    <div className="space-y-4 animate-fadeIn w-full">
+      
+      {/* Top Navigation & Sub-View Switcher Bar */}
+      <div className={`flex flex-wrap items-center justify-between gap-3 p-3 sm:p-4 rounded-2xl border transition-all duration-300 shadow-md ${
+        isLight
+          ? 'bg-white border-slate-200 text-slate-900'
+          : 'bg-[#10192D] border-blue-500/20 text-white'
+      }`}>
+        <div className="flex items-center gap-2 flex-wrap">
+          {/* Back to Warehouse Selection (The 3 Buttons) */}
+          <button
+            onClick={() => setActiveSubView(null)}
+            className={`px-3.5 py-2 rounded-xl text-xs font-black transition-all flex items-center gap-1.5 border cursor-pointer shadow ${
+              isLight
+                ? 'bg-blue-50 hover:bg-blue-100 text-blue-700 border-blue-200'
+                : 'bg-slate-800 hover:bg-slate-700 text-cyan-300 hover:text-white border-cyan-500/30'
+            }`}
+            title={t('الرجوع لأزرار المخزن الرئيسية', 'گەڕانەوە بۆ دوگمەکانی کۆگا', 'Back to Warehouse Menu')}
+          >
+            <span>←</span>
+            <span>{t('أقسام المخزن', 'دوگمەکانی کۆگا', 'Warehouse Sections')}</span>
+          </button>
+
+          {onBackToDashboard && (
+            <button
+              onClick={onBackToDashboard}
+              className={`px-3 py-2 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 border cursor-pointer shrink-0 ${
+                isLight
+                  ? 'bg-slate-100 hover:bg-slate-200 text-slate-700 border-slate-300'
+                  : 'bg-slate-900 hover:bg-slate-800 text-slate-300 hover:text-white border-slate-700'
+              }`}
+              title={t('الرجوع للقائمة الرئيسية', 'گەڕانەوە بۆ پێڕستی سەرەکی', 'Back to Main Menu')}
+            >
+              <LayoutDashboard className={`w-3.5 h-3.5 ${isLight ? 'text-slate-600' : 'text-slate-400'}`} />
+              <span className="hidden sm:inline">{t('الرئيسية', 'سەرەکی', 'Dashboard')}</span>
+            </button>
+          )}
+
+          {/* Direct Switch Buttons */}
+          <div className={`flex items-center gap-1.5 p-1 rounded-xl border ${
+            isLight
+              ? 'bg-slate-100 border-slate-200'
+              : 'bg-[#070D1A] border-blue-500/30'
+          }`}>
+            <button
+              onClick={() => setActiveSubView('catalog')}
+              className={`px-3 py-1.5 rounded-lg font-black text-xs transition-all flex items-center gap-1.5 cursor-pointer ${
+                activeSubView === 'catalog'
+                  ? isLight
+                    ? 'bg-blue-600 text-white shadow-sm'
+                    : 'bg-gradient-to-r from-cyan-500 to-blue-600 text-white shadow-[0_0_12px_rgba(6,182,212,0.4)]'
+                  : isLight
+                    ? 'text-slate-600 hover:text-slate-900'
+                    : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              <Package className="w-3.5 h-3.5" />
+              <span>{t('دليل وسجل المواد والأسعار', 'ڕێبەری کاڵاکان و نرخەکان', 'Products & Prices')}</span>
+              <span className={`text-[10px] font-mono px-1.5 py-0.5 rounded ${
+                isLight ? 'bg-blue-100 text-blue-800' : 'bg-black/40 text-cyan-200'
+              }`}>{products.length}</span>
+            </button>
+
+            <button
+              onClick={() => setActiveSubView('stockStatus')}
+              className={`px-3 py-1.5 rounded-lg font-black text-xs transition-all flex items-center gap-1.5 cursor-pointer ${
+                activeSubView === 'stockStatus'
+                  ? isLight
+                    ? 'bg-amber-600 text-white shadow-sm'
+                    : 'bg-gradient-to-r from-amber-500 to-orange-600 text-white shadow-[0_0_12px_rgba(245,158,11,0.4)]'
+                  : isLight
+                    ? 'text-slate-600 hover:text-slate-900'
+                    : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              <AlertTriangle className={`w-3.5 h-3.5 ${activeSubView === 'stockStatus' ? 'text-white' : 'text-amber-500'}`} />
+              <span>{t('المواد المتبقية والنافذة (حالة المخزون)', 'کاڵا ماوەکان و تەواوبووەکان (دۆخی کۆگا)', 'Stock Status')}</span>
+              {(lowStockProducts.length > 0 || outOfStockProducts.length > 0) && (
+                <span className="text-[10px] font-mono px-1.5 py-0.5 bg-rose-500 text-white rounded font-bold">
+                  {lowStockProducts.length + outOfStockProducts.length}
+                </span>
+              )}
+            </button>
+
+            {/* Expiry Alerts subview tab button */}
+            <button
+              onClick={() => setActiveSubView('expiryAlerts')}
+              className={`px-3 py-1.5 rounded-lg font-black text-xs transition-all flex items-center gap-1.5 cursor-pointer ${
+                activeSubView === 'expiryAlerts'
+                  ? isLight
+                    ? 'bg-rose-600 text-white shadow-sm'
+                    : 'bg-gradient-to-r from-rose-500 to-red-600 text-white shadow-[0_0_12px_rgba(244,63,94,0.4)]'
+                  : isLight
+                    ? 'text-slate-600 hover:text-slate-900'
+                    : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              <Clock className={`w-3.5 h-3.5 ${activeSubView === 'expiryAlerts' ? 'text-white' : 'text-rose-500'}`} />
+              <span>{t('المواد المنتهية والصلاحيات', 'کاڵا بەسەرچووەکان و بەروار', 'Expiry Alerts')}</span>
+              {(expiryStats.expiredCount > 0 || expiryStats.nearExpiryCount > 0) && (
+                <span className="text-[10px] font-mono px-1.5 py-0.5 bg-rose-500 text-white rounded font-bold">
+                  {expiryStats.expiredCount + expiryStats.nearExpiryCount}
+                </span>
+              )}
+            </button>
+
+            {canManageAudit && (
+              <button
+                onClick={() => setActiveSubView('inventoryAudit')}
+                className={`px-3 py-1.5 rounded-lg font-black text-xs transition-all flex items-center gap-1.5 cursor-pointer ${
+                  activeSubView === 'inventoryAudit'
+                    ? isLight
+                      ? 'bg-gradient-to-r from-amber-500 to-orange-600 text-white shadow-sm'
+                      : 'bg-gradient-to-r from-amber-500 via-orange-600 to-amber-600 text-white shadow-[0_0_12px_rgba(245,158,11,0.4)]'
+                    : isLight
+                      ? 'text-slate-600 hover:text-slate-900'
+                      : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                <ClipboardCheck className={`w-3.5 h-3.5 ${activeSubView === 'inventoryAudit' ? 'text-white' : 'text-amber-500'}`} />
+                <span>{t('جرد وتدقيق المخزون الفعلي', 'پشکنین و جردی کۆگا', 'Inventory Audit')}</span>
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* Action Buttons for Catalog View */}
+        {activeSubView !== 'inventoryAudit' && activeSubView !== 'expiryAlerts' && (
+          <div className="flex flex-wrap items-center gap-2">
+            {/* Hidden File Input for Importing Products / Backup */}
+            <input
+              type="file"
+              ref={fileInputRef}
+              accept=".json, .xlsx, .xls"
+              className="hidden"
+              onChange={async (e) => {
+                const file = e.target.files?.[0];
+                if (!file) return;
+
+                try {
+                  if (file.name.endsWith('.xlsx') || file.name.endsWith('.xls')) {
+                    const excelParsed = await parseExcelBackupFile(file);
+                    if (excelParsed.products && excelParsed.products.length > 0) {
+                      const merged = [...products];
+                      let newCount = 0;
+                      let updatedCount = 0;
+
+                      excelParsed.products.forEach((importedP) => {
+                        let matchIdx = merged.findIndex(p =>
+                          (importedP.barcode && p.barcode && p.barcode.trim() === importedP.barcode.trim()) ||
+                          p.id === importedP.id ||
+                          p.name.toLowerCase() === importedP.name.toLowerCase()
+                        );
+
+                        // Fuzzy Matching check for slight spelling variations
+                        if (matchIdx === -1 && importedP.name) {
+                          const fuzzyMatch = findBestFuzzyProductMatch(importedP.name, merged, {
+                            barcode: importedP.barcode,
+                            threshold: 0.82
+                          });
+                          if (fuzzyMatch.matchedProduct) {
+                            matchIdx = merged.findIndex(p => p.id === fuzzyMatch.matchedProduct!.id);
+                          }
+                        }
+
+                        if (matchIdx !== -1) {
+                          // Update existing item to avoid duplicate
+                          merged[matchIdx] = {
+                            ...merged[matchIdx],
+                            stock: (merged[matchIdx].stock || 0) + (importedP.stock || 0),
+                            totalUnits: (merged[matchIdx].totalUnits || 0) + (importedP.totalUnits || 0),
+                            price: importedP.price || merged[matchIdx].price,
+                            cost: importedP.cost || merged[matchIdx].cost,
+                            lastPriceUpdate: new Date().toISOString()
+                          };
+                          updatedCount++;
+                        } else {
+                          merged.unshift(importedP);
+                          newCount++;
+                        }
+                      });
+
+                      setProducts(merged);
+                      localStorage.setItem('supermarket_products_v1', JSON.stringify(merged));
+                      syncBulkWriteCollection('products', merged);
+                      setImportBanner(isAr ? `✅ تم استيراد وترتيب المواد بنجاح (${newCount} مادة جديدة، وتحديث ${updatedCount} مادة موجودة بدون تكرار)!` : `✅ Successfully imported products (${newCount} new, ${updatedCount} updated without duplicates)!`);
+                      setTimeout(() => setImportBanner(''), 6000);
+                    } else {
+                      alert(isAr ? 'لم يتم العثور على ورقة مواد صالحة في ملف الإكسل!' : 'No valid products sheet found in Excel file!');
+                    }
+                  } else {
+                    const reader = new FileReader();
+                    reader.onload = (event) => {
+                      try {
+                        const jsonText = event.target?.result as string;
+                        const parsedData = JSON.parse(jsonText);
+                        const importedProds: Product[] = Array.isArray(parsedData)
+                          ? parsedData
+                          : (parsedData.products && Array.isArray(parsedData.products) ? parsedData.products : []);
+
+                        if (importedProds.length > 0) {
+                          const merged = [...products];
+                          let newCount = 0;
+                          let updatedCount = 0;
+
+                          importedProds.forEach((importedP) => {
+                            let matchIdx = merged.findIndex(p =>
+                              (importedP.barcode && p.barcode && p.barcode.trim() === importedP.barcode.trim()) ||
+                              p.id === importedP.id ||
+                              p.name.toLowerCase() === importedP.name.toLowerCase()
+                            );
+
+                            // Fuzzy Matching check for slight spelling variations
+                            if (matchIdx === -1 && importedP.name) {
+                              const fuzzyMatch = findBestFuzzyProductMatch(importedP.name, merged, {
+                                barcode: importedP.barcode,
+                                threshold: 0.82
+                              });
+                              if (fuzzyMatch.matchedProduct) {
+                                matchIdx = merged.findIndex(p => p.id === fuzzyMatch.matchedProduct!.id);
+                              }
+                            }
+
+                            if (matchIdx !== -1) {
+                              merged[matchIdx] = {
+                                ...merged[matchIdx],
+                                stock: (merged[matchIdx].stock || 0) + (importedP.stock || 0),
+                                totalUnits: (merged[matchIdx].totalUnits || 0) + (importedP.totalUnits || 0),
+                                price: importedP.price || merged[matchIdx].price,
+                                cost: importedP.cost || merged[matchIdx].cost,
+                                lastPriceUpdate: new Date().toISOString()
+                              };
+                              updatedCount++;
+                            } else {
+                              merged.unshift(importedP);
+                              newCount++;
+                            }
+                          });
+
+                          setProducts(merged);
+                          localStorage.setItem('supermarket_products_v1', JSON.stringify(merged));
+                          syncBulkWriteCollection('products', merged);
+                          setImportBanner(isAr ? `✅ تم استيراد وترتيب المواد بنجاح (${newCount} مادة جديدة، وتحديث ${updatedCount} مادة موجودة بدون تكرار)!` : `✅ Successfully imported products (${newCount} new, ${updatedCount} updated without duplicates)!`);
+                          setTimeout(() => setImportBanner(''), 6000);
+                        } else {
+                          alert(isAr ? 'لم يتم العثور على قائمة مواد صالحة في ملف JSON!' : 'No valid products list found in JSON!');
+                        }
+                      } catch (err) {
+                        alert(isAr ? 'ملف JSON غير صالح!' : 'Invalid JSON file!');
+                      }
+                    };
+                    reader.readAsText(file);
+                  }
+                } catch (err) {
+                  alert(isAr ? 'حدث خطأ أثناء قراءة الملف!' : 'Error reading file!');
+                } finally {
+                  e.target.value = '';
+                }
+              }}
+            />
+
+            {canEditProducts && onOpenAIInvoiceScanner && (
+              <button
+                type="button"
+                onClick={onOpenAIInvoiceScanner}
+                className="flex items-center gap-2 px-3.5 py-2 rounded-xl bg-gradient-to-r from-purple-600 via-fuchsia-600 to-indigo-600 text-white text-xs font-black shadow-[0_0_20px_rgba(168,85,247,0.45)] hover:brightness-110 active:scale-95 transition-all cursor-pointer shrink-0 border-2 border-purple-300/60"
+                title={t('إضافة أدوية ومواد جديدة بالصور أو بملفات PDF للوصل فوراً بالذكاء الاصطناعي وبدون مفتاح', 'زیادکردنی دەرمان بە وێنە یان فایلی PDFی پسوولە بێ کلیل', 'Add Medicines via Invoice Photos / PDF (AI)')}
+              >
+                <Sparkles className="w-4 h-4 text-purple-200 animate-pulse" />
+                <span>{t('📸 إضافة مواد بالصور أو PDF الوصل (AI)', '📸 زیادکردنی دەرمان بە وێنە یان PDF (AI)', '📸 Add Items via Photo / PDF (AI)')}</span>
+              </button>
+            )}
+
+            {canEditProducts && onOpenLegacyScreenMigrator && (
+              <button
+                type="button"
+                onClick={onOpenLegacyScreenMigrator}
+                className="flex items-center gap-2 px-3.5 py-2 rounded-xl bg-gradient-to-r from-cyan-600 via-blue-600 to-indigo-600 text-white text-xs font-black shadow-[0_0_20px_rgba(6,182,212,0.45)] hover:brightness-110 active:scale-95 transition-all cursor-pointer shrink-0 border-2 border-cyan-300/60"
+                title={t('نقل وتوليد الأدوية مباشرة من صور شاشات البرامج القديمة بالذكاء الاصطناعي وبدون مفتاح', 'هاوردەی دەرمان لە شاشەی سیستەمی کۆن بە AI بێ کلیل', 'Migrate Medicines from Legacy Screen (AI)')}
+              >
+                <Monitor className="w-4 h-4 text-cyan-200 animate-pulse" />
+                <span>{t('🖥️ نقل أدوية من شاشة برنامج قديم (AI)', '🖥️ گواستنەوەی دەرمان لە شاشەی کۆن (AI)', '🖥️ Legacy Screen Medicines (AI)')}</span>
+              </button>
+            )}
+
+            {canEditProducts && (
+              <button
+                onClick={() => fileInputRef.current?.click()}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-gradient-to-r from-blue-600 via-indigo-600 to-purple-600 text-white text-xs font-bold shadow hover:brightness-110 active:scale-95 transition-all cursor-pointer shrink-0"
+                title={t('استيراد مواد أو ملف إكسل للمخزن', 'هێنانی کاڵاکان لە فایلی ئێکسڵ', 'Import products from Excel / JSON file')}
+              >
+                <Upload className="w-3.5 h-3.5 text-blue-100" />
+                <span>{t('استيراد مواد (Excel / JSON)', 'استيراد (Excel / JSON)', 'Import Products')}</span>
+              </button>
+            )}
+
+            {onOpenPrintBarcode && (
+              <button
+                onClick={() => onOpenPrintBarcode(filteredProducts[0] || products[0] || null)}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-gradient-to-r from-amber-500 via-orange-600 to-amber-600 text-white text-xs font-bold shadow hover:brightness-110 active:scale-95 transition-all cursor-pointer shrink-0 border border-amber-400/30"
+                title={t('مولد وتصميم ملصقات الباركود والأسعار', 'دروستکەری ستیکەری بارکۆد و نرخ', 'Barcode & Price Tag Generator')}
+              >
+                <Printer className="w-3.5 h-3.5 text-amber-100" />
+                <span>{t('مولد ملصقات الباركود', 'دروستکەری بارکۆد', 'Barcode Generator')}</span>
+              </button>
+            )}
+
+            <button
+              onClick={() => exportProductsToExcel(filteredProducts, `products_list_${new Date().toISOString().split('T')[0]}.xlsx`)}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-gradient-to-r from-emerald-600 via-teal-600 to-green-600 text-white text-xs font-bold shadow hover:brightness-110 active:scale-95 transition-all cursor-pointer shrink-0"
+              title={t('تصدير المواد الحالية إلى ملف إكسل', 'ناردنی کاڵاکان بۆ فایلی ئێکسڵ', 'Export current products to Excel')}
+            >
+              <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-100" />
+              <span>{t('تصدير إكسل (.xlsx)', 'ناردن بۆ ئێکسڵ (.xlsx)', 'Export Excel')}</span>
+            </button>
+
+            {canEditProducts && (
+              <button
+                onClick={onOpenAddModal}
+                className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl bg-gradient-to-r from-emerald-600 via-teal-600 to-cyan-600 text-white text-xs font-bold shadow hover:brightness-110 active:scale-95 transition-all cursor-pointer shrink-0"
+              >
+                <Plus className="w-3.5 h-3.5" />
+                <span>{t('إدخال مادة جديدة', 'زیادکردنی کاڵای نوێ', 'New Product Entry')}</span>
+              </button>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* View 3: Dedicated Physical Inventory Audit Sub-View (واجهة الجرد ومطابقة الأرصدة) */}
+      {activeSubView === 'inventoryAudit' && (
+        <InventoryAuditView
+          products={products}
+          setProducts={setProducts}
+          settings={settings}
+          currentUser={currentUser}
+          onBackToWarehouse={() => setActiveSubView('catalog')}
+          onNavigateToReports={onNavigateToReports}
+        />
+      )}
+
+      {/* View 4: Dedicated Expiry & Near-Expiry Management Sub-View (واجهة المواد المنتهية والصلاحيات) */}
+      {activeSubView === 'expiryAlerts' && (
+        <ExpiryManagementView
+          products={products}
+          setProducts={setProducts}
+          settings={settings}
+          currentUser={currentUser}
+          onEditProduct={onEditProduct}
+          onOpenPrintBarcode={onOpenPrintBarcode}
+          onOpenDamagedItems={onOpenDamagedItems}
+          onBackToWarehouseMenu={() => setActiveSubView(null)}
+        />
+      )}
+
+      {/* Catalog & Stock Status Search + Views */}
+      {activeSubView !== 'inventoryAudit' && activeSubView !== 'expiryAlerts' && (
+        <>
+          {/* Import Notification Banner */}
+          {importBanner && (
+            <div className="p-3 bg-emerald-900/60 border border-emerald-500/50 rounded-2xl text-emerald-200 text-xs font-bold flex items-center justify-between shadow-lg animate-fadeIn">
+              <span>{importBanner}</span>
+              <button onClick={() => setImportBanner('')} className="text-emerald-400 font-black hover:text-white">✕</button>
+            </div>
+          )}
+
+          {/* Streamlined Search & Optional Category Filter Bar */}
+          <div className={`p-3.5 rounded-2xl border space-y-2.5 transition-all ${
+            isLight
+              ? 'bg-white border-slate-200 shadow-sm'
+              : 'bg-[#10192D] border-blue-500/20 shadow-md'
+          }`}>
+        <div className="flex flex-wrap items-center justify-between gap-2.5">
+          
+          {/* Search Box */}
+          <div className="relative flex-1 min-w-[220px]">
+            <FastSearchInput
+              value={search}
+              onChange={setSearch}
+              placeholder={t('بحث فوري بالباركود، اسم المادة، أو اسم المندوب...', 'گەڕانی خێرا بە بارکۆد، ناوی کاڵا، یان ناوی مەندوب...', 'Fast search barcode, product name, or delegate...')}
+              isLight={isLight}
+              debounceMs={80}
+            />
+          </div>
+
+          {/* OPTIONAL CATEGORY TOGGLE BUTTON */}
+          <div className="relative shrink-0">
+            <button
+              onClick={() => setShowCategories(!showCategories)}
+              className={`px-3 py-1.5 rounded-xl font-bold text-xs transition-all flex items-center gap-1.5 cursor-pointer border shadow-sm ${
+                selectedCat !== 'ALL' || showCategories
+                  ? 'bg-gradient-to-r from-blue-600 to-cyan-600 text-white border-cyan-400/50 shadow-sm'
+                  : isLight
+                    ? 'bg-slate-100 text-slate-700 border-slate-300 hover:bg-slate-200'
+                    : 'bg-[#0B1120] text-slate-300 border-blue-500/20 hover:border-cyan-500/40'
+              }`}
+              title={t('إظهر / إخفاء قائمة التصنيفات', 'نیشاندان / شاردنەوەی پۆلەکان', 'Toggle Categories List')}
+            >
+              <Filter className={`w-3.5 h-3.5 ${selectedCat !== 'ALL' || showCategories ? 'text-white' : isLight ? 'text-blue-600' : 'text-cyan-300'}`} />
+              <span>
+                {selectedCat === 'ALL' 
+                  ? t('جميع التصنيفات', 'هەموو پۆلەکان', 'All Categories') 
+                  : `${t('تصنيف:', 'پۆل:', 'Cat:')} ${selectedCat}`}
+              </span>
+              <span className="text-[10px] font-extrabold">{showCategories ? '▲' : '▼'}</span>
+            </button>
+          </div>
+
+          {/* Stock Filter Pills */}
+          <div className={`flex items-center space-x-1 rtl:space-x-reverse p-1 rounded-xl border text-xs shrink-0 flex-wrap sm:flex-nowrap gap-1 sm:gap-0 ${
+            isLight ? 'bg-slate-100 border-slate-200' : 'bg-[#0B1120] border-blue-500/20'
+          }`}>
+            <button
+              onClick={() => setStockFilter('ALL')}
+              className={`px-2.5 py-1 rounded-lg font-semibold transition-all ${
+                stockFilter === 'ALL'
+                  ? isLight ? 'bg-blue-600 text-white shadow-sm' : 'bg-cyan-500 text-white shadow'
+                  : isLight ? 'text-slate-600 hover:text-slate-900' : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              {t('الكل', 'هەمووی', 'All')} ({totalProductsCount})
+            </button>
+
+            <button
+              onClick={() => setStockFilter('LOW')}
+              className={`px-2.5 py-1 rounded-lg font-semibold transition-all ${
+                stockFilter === 'LOW'
+                  ? 'bg-amber-500 text-white shadow-sm'
+                  : isLight ? 'text-amber-700 hover:text-amber-900' : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              {t('منخفض', 'کەمبووەوە', 'Low')} ({lowStockProducts.length})
+            </button>
+
+            <button
+              onClick={() => setStockFilter('OUT')}
+              className={`px-2.5 py-1 rounded-lg font-semibold transition-all ${
+                stockFilter === 'OUT'
+                  ? 'bg-rose-500 text-white shadow-sm'
+                  : isLight ? 'text-rose-700 hover:text-rose-900' : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              {t('نفد', 'تەواوبوو', 'Out')} ({outOfStockProducts.length})
+            </button>
+
+            <button
+              onClick={() => setStockFilter('DEBT')}
+              className={`px-2.5 py-1 rounded-lg font-bold transition-all flex items-center gap-1 cursor-pointer ${
+                stockFilter === 'DEBT' 
+                  ? 'bg-gradient-to-r from-rose-600 to-amber-600 text-white shadow ring-2 ring-rose-400/40' 
+                  : isLight ? 'text-rose-700 hover:text-rose-900' : 'text-rose-400 hover:text-rose-300'
+              }`}
+              title={t('عرض المواد المسحوبة على المكشوف / قيد بالسالب', 'پیشاندانی دەرمانە قەرزکراوەکانی کۆگا', 'Show Overdraft/Negative Stock Items')}
+            >
+              <AlertTriangle className="w-3 h-3 text-amber-500 shrink-0" />
+              <span>{t('قرض/سالب', 'قەرزی کۆگا (سالب)', 'Deficit / Loan')}</span>
+              <span className="font-mono text-[10px]">({debtStockProducts.length})</span>
+            </button>
+          </div>
+
+          {/* Table / Grid Toggle */}
+          <div className={`flex items-center space-x-1 rtl:space-x-reverse p-1 rounded-xl border shrink-0 ${
+            isLight ? 'bg-slate-100 border-slate-200' : 'bg-[#0B1120] border-blue-500/20'
+          }`}>
+            <button
+              onClick={() => setViewMode('table')}
+              className={`p-1.5 rounded-lg transition-all cursor-pointer ${
+                viewMode === 'table'
+                  ? 'bg-blue-600 text-white shadow-sm'
+                  : isLight ? 'text-slate-600 hover:text-slate-900' : 'text-slate-400 hover:text-white'
+              }`}
+              title={t('عرض جدول تفصيلي', 'پیشاندانی خشتە', 'Table View')}
+            >
+              <List className="w-4 h-4" />
+            </button>
+            <button
+              onClick={() => setViewMode('grid')}
+              className={`p-1.5 rounded-lg transition-all cursor-pointer ${
+                viewMode === 'grid'
+                  ? 'bg-blue-600 text-white shadow-sm'
+                  : isLight ? 'text-slate-600 hover:text-slate-900' : 'text-slate-400 hover:text-white'
+              }`}
+              title={t('عرض بطاقات شبكية', 'پیشاندانی کارتەکان', 'Grid View')}
+            >
+              <LayoutGrid className="w-4 h-4" />
+            </button>
+          </div>
+        </div>
+
+        {/* Categories Pills (Expanded) */}
+        {showCategories && (
+          <div className={`flex items-center gap-1.5 flex-wrap pt-2.5 border-t ${
+            isLight ? 'border-slate-200' : 'border-slate-800'
+          }`}>
+            <button
+              onClick={() => setSelectedCat('ALL')}
+              className={`px-3 py-1 rounded-xl text-xs font-bold transition-all cursor-pointer ${
+                selectedCat === 'ALL'
+                  ? 'bg-blue-600 text-white shadow'
+                  : isLight
+                  ? 'bg-slate-100 text-slate-700 hover:bg-slate-200'
+                  : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
+              }`}
+            >
+              {t('الكل', 'هەمووی', 'All')}
+            </button>
+            {categoriesList.map(cat => (
+              <button
+                key={cat}
+                onClick={() => setSelectedCat(cat)}
+                className={`px-3 py-1 rounded-xl text-xs font-bold transition-all cursor-pointer ${
+                  selectedCat === cat
+                    ? 'bg-blue-600 text-white shadow'
+                    : isLight
+                    ? 'bg-blue-50 text-blue-700 border border-blue-200'
+                    : 'bg-slate-800 text-cyan-300 border border-blue-500/20 hover:bg-slate-700'
+                }`}
+              >
+                {cat}
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* View 1: Catalog & Pricing Sub-View (دليل وسجل المواد والأسعار) */}
+      {activeSubView === 'catalog' && (
+        <div className="space-y-3">
+          {renderPagination()}
+
+          {viewMode === 'table' ? (
+            <div className={`rounded-2xl border overflow-hidden shadow-lg transition-all ${
+              isLight ? 'bg-white border-slate-200 shadow-sm' : 'cyber-card border-blue-500/20'
+            }`}>
+              <div className="overflow-x-auto">
+                <table className="w-full text-left rtl:text-right text-[11px]">
+                  <thead>
+                    <tr className={`border-b font-semibold uppercase text-[10px] whitespace-nowrap transition-colors ${
+                      isLight
+                        ? 'border-slate-200 bg-slate-100/90 text-slate-700'
+                        : 'border-slate-800 text-slate-400 bg-[#0B1120]/90'
+                    }`}>
+                      <th className="py-2.5 px-2">{t('الباركود', 'بارکۆد', 'Barcode')}</th>
+                      <th className="py-2.5 px-2">{t('اسم المادة', 'ناوی کاڵا', 'Product Name')}</th>
+                      <th className="py-2.5 px-2">{t('المندوب', 'مەندوب', 'Delegate')}</th>
+                      <th className="py-2.5 px-2">{t('التصنيف', 'پۆلێن', 'Category')}</th>
+                      {canViewPurchasePrice ? (
+                        <>
+                          <th className="py-2.5 px-2 text-center">{t('سعر الكرتون/القطعة', 'نرخی کارتۆن/دانە', 'Carton/Unit Cost')}</th>
+                          <th className="py-2.5 px-2 text-center">{t('أسعار البيع', 'نرخی فرۆشتن', 'Sell Prices')}</th>
+                          <th className="py-2.5 px-2 text-center text-emerald-600 dark:text-emerald-400">{t('الأرباح', 'قازانجەکان', 'Profits')}</th>
+                        </>
+                      ) : (
+                        <>
+                          <th className="py-2.5 px-2 text-center">{t('الكمية المتبقية والكراتين', 'بڕی ماوە و کارتۆن', 'Remaining & Cartons')}</th>
+                          <th className="py-2.5 px-2 text-center">{t('سعر البيع (مفرد / كرتون)', 'نرخی فرۆشتن (تاک / کارتۆن)', 'Sell (Single / Carton)')}</th>
+                        </>
+                      )}
+                      <th className="py-2.5 px-2">{t('التواريخ', 'بەروارەکان', 'Dates')}</th>
+                      <th className="py-2.5 px-2 text-center">{t('إجراءات', 'کردارەکان', 'Actions')}</th>
+                    </tr>
+                  </thead>
+                  <tbody className={`divide-y whitespace-nowrap ${
+                    isLight ? 'divide-slate-200 text-slate-800' : 'divide-slate-800/60 text-slate-200'
+                  }`}>
+                    {paginatedProducts.map((p) => {
+                      const numCartons = p.cartonsCount || 1;
+                      const numUnits = p.unitsPerCarton || 12;
+                      const cartonCost = p.cartonPurchasePrice || (p.cost * numUnits);
+                      const unitCost = p.costPerUnit || (numUnits > 0 ? cartonCost / numUnits : p.cost);
+
+                      const singleSell = p.singleRetailPrice || p.price;
+                      const wholesaleSell = p.wholesalePrice || (p.price * 0.85);
+                      const cartonSell = p.cartonSellingPrice || (p.price * numUnits * 0.95);
+
+                      const singleProfitVal = p.singleProfit !== undefined ? p.singleProfit : (singleSell - unitCost);
+                      const wholesaleProfitVal = p.wholesaleProfit !== undefined ? p.wholesaleProfit : (wholesaleSell - unitCost);
+                      const cartonProfitVal = p.cartonProfit !== undefined ? p.cartonProfit : (cartonSell - cartonCost);
+
+                      return (
+                        <tr key={p.id} className={`transition-colors ${
+                          isLight ? 'hover:bg-blue-50/50' : 'hover:bg-slate-800/40'
+                        }`}>
+                          {/* 1. Barcode */}
+                          <td className={`py-2 px-2 font-mono font-bold text-[11px] ${
+                            isLight ? 'text-blue-700' : 'text-cyan-400'
+                          }`}>
+                            {p.barcode}
+                          </td>
+
+                          {/* 2. Product Name */}
+                          <td className="py-2 px-2">
+                            <div className="flex items-center gap-1.5">
+                              <span className={`text-base p-1 rounded ${
+                                isLight ? 'bg-slate-100' : 'bg-slate-800/80'
+                              }`}>{p.imageIcon || '💊'}</span>
+                              <div>
+                                <p className={`font-bold text-[11px] leading-tight ${
+                                  isLight ? 'text-slate-900' : 'text-slate-100'
+                                }}`}>{p.nameAr || p.name}</p>
+                                {p.scientificName ? (
+                                  <p className={`text-[9.5px] font-mono leading-tight font-semibold ${
+                                    isLight ? 'text-blue-600' : 'text-cyan-300'
+                                  }`}>🧪 {p.scientificName}</p>
+                                ) : (
+                                  <p className="text-[9px] text-slate-500 font-mono leading-none">{p.name}</p>
+                                )}
+                                {p.dosageForm && (
+                                  <span className={`text-[8.5px] font-sans ${
+                                    isLight ? 'text-slate-500' : 'text-slate-400'
+                                  }`}>{p.dosageForm}</span>
+                                )}
+                              </div>
+                            </div>
+                          </td>
+
+                          {/* 3. Delegate / Supplier & Batch */}
+                          <td className={`py-2 px-2 ${isLight ? 'text-slate-700' : 'text-slate-300'}`}>
+                            <div className="flex items-center gap-1 text-[10px]">
+                              <UserCheck className={`w-3 h-3 ${isLight ? 'text-blue-600' : 'text-blue-400'} shrink-0`} />
+                              <span>{p.supplierDelegate || p.supplierName || 'عام'}</span>
+                            </div>
+                            {p.batchNumber && (
+                              <div className={`text-[9px] font-mono font-semibold ${
+                                isLight ? 'text-amber-700' : 'text-amber-400'
+                              }`}>
+                                Batch: {p.batchNumber}
+                              </div>
+                            )}
+                          </td>
+
+                          {/* 4. Category */}
+                          <td className="py-2 px-2">
+                            <span className={`px-2 py-0.5 rounded text-[10px] font-medium ${
+                              isLight ? 'bg-slate-100 text-slate-700 border border-slate-200' : 'bg-slate-800 text-slate-300'
+                            }`}>
+                              {p.categoryAr || p.category}
+                            </span>
+                          </td>
+
+                          {/* 5, 6, 7. Pricing / Stock based on permission */}
+                          {canViewPurchasePrice ? (
+                            <>
+                              {/* Cost Breakdown */}
+                              <td className="py-2 px-2 text-center font-mono">
+                                <div className={`font-bold text-xs ${isLight ? 'text-amber-700' : 'text-amber-300'}`}>
+                                  {settings.currencySymbol}{formatNumber(cartonCost)} <span className={`text-[9px] font-normal ${isLight ? 'text-slate-500' : 'text-slate-400'}`}>/ كرتون</span>
+                                </div>
+                                <div className={`text-[10px] ${isLight ? 'text-slate-500' : 'text-slate-400'}`}>
+                                  ({settings.currencySymbol}{formatNumber(unitCost)} / قطعة)
+                                </div>
+                              </td>
+
+                              {/* Selling Prices */}
+                              <td className="py-2 px-2 text-center font-mono">
+                                <PriceHistoryTooltip product={p} currency={settings.currencySymbol} isAr={isAr}>
+                                  <div className={`font-bold text-xs hover:underline cursor-help ${isLight ? 'text-emerald-700' : 'text-emerald-400'}`}>
+                                    {settings.currencySymbol}{formatNumber(singleSell)} <span className={`text-[9px] font-normal ${isLight ? 'text-slate-500' : 'text-slate-400'}`}>/ مفرد</span>
+                                  </div>
+                                </PriceHistoryTooltip>
+                                <div className={`text-[9.5px] font-semibold ${isLight ? 'text-blue-700' : 'text-cyan-300'}`}>
+                                  {settings.currencySymbol}{formatNumber(wholesaleSell)} / جملة
+                                </div>
+                              </td>
+
+                              {/* Profit Breakdown */}
+                              <td className="py-2 px-2 text-center font-mono">
+                                <span className={`px-1.5 py-0.5 rounded border font-bold text-[10px] ${
+                                  isLight
+                                    ? 'bg-emerald-50 border-emerald-300 text-emerald-800'
+                                    : 'bg-emerald-950/80 border-emerald-500/30 text-emerald-300'
+                                }`}>
+                                  +{settings.currencySymbol}{formatNumber(singleProfitVal)}
+                                </span>
+                                <span className={`block text-[8.5px] mt-0.5 ${isLight ? 'text-slate-500' : 'text-slate-400'}`}>
+                                  (كرتون: +{settings.currencySymbol}{formatNumber(cartonProfitVal)})
+                                </span>
+                              </td>
+                            </>
+                          ) : (
+                            <>
+                              {/* Stock Units & Cartons */}
+                              <td className="py-2 px-2 text-center font-mono">
+                                <span className={`px-2 py-0.5 rounded-lg font-bold text-xs ${
+                                  p.stock <= 0
+                                    ? 'bg-rose-100 text-rose-800'
+                                    : p.stock <= p.minStock
+                                    ? 'bg-amber-100 text-amber-900'
+                                    : isLight
+                                    ? 'bg-emerald-50 text-emerald-800'
+                                    : 'bg-emerald-950/60 text-emerald-300'
+                                }`}>
+                                  {p.stock} {t('قطعة', 'دانە', 'pcs')}
+                                </span>
+                                <span className={`block text-[10px] mt-0.5 ${isLight ? 'text-slate-500' : 'text-slate-400'}`}>
+                                  ({numCartons} {t('كرتون', 'کارتۆن', 'ctn')})
+                                </span>
+                              </td>
+
+                              {/* Selling Prices Single & Carton */}
+                              <td className="py-2 px-2 text-center font-mono">
+                                <div className={`font-bold text-xs ${isLight ? 'text-emerald-700' : 'text-emerald-400'}`}>
+                                  {settings.currencySymbol}{formatNumber(singleSell)} <span className={`text-[9px] font-normal ${isLight ? 'text-slate-500' : 'text-slate-400'}`}>/ {t('مفرد', 'تاک', 'Single')}</span>
+                                </div>
+                                <div className={`text-[10px] font-bold ${isLight ? 'text-blue-700' : 'text-cyan-300'}`}>
+                                  {settings.currencySymbol}{formatNumber(cartonSell)} / {t('كرتون', 'کارتۆن', 'Carton')}
+                                </div>
+                              </td>
+                            </>
+                          )}
+
+                          {/* 8. Production & Expiry Dates */}
+                          <td className={`py-2 px-2 text-[10px] font-mono ${isLight ? 'text-slate-700' : 'text-slate-300'}`}>
+                            {p.expiryDate ? (
+                              <div className="flex items-center gap-1">
+                                <Calendar className="w-3 h-3 text-rose-500 shrink-0" />
+                                <span>{p.expiryDate}</span>
+                              </div>
+                            ) : (
+                              <span className={isLight ? 'text-slate-400' : 'text-slate-600'}>-</span>
+                            )}
+                            {p.productionDate && (
+                              <span className={`text-[9px] block ${isLight ? 'text-slate-500' : 'text-slate-500'}`}>P: {p.productionDate}</span>
+                            )}
+                          </td>
+
+                          {/* 9. Actions */}
+                          <td className="py-2 px-2 text-center">
+                            <div className="flex items-center justify-center gap-1">
+                              {onOpenPrintBarcode && (
+                                <button
+                                  type="button"
+                                  onClick={() => onOpenPrintBarcode(p)}
+                                  className={`p-1 rounded border cursor-pointer transition-all ${
+                                    isLight
+                                      ? 'bg-amber-50 text-amber-700 hover:bg-amber-100 border-amber-200'
+                                      : 'bg-amber-500/20 text-amber-300 hover:bg-amber-500/30 border-amber-500/30'
+                                  }`}
+                                  title="طباعة ملصق الباركود"
+                                >
+                                  <Printer className="w-3.5 h-3.5" />
+                                </button>
+                              )}
+                              {canEditProducts && (
+                                <>
+                                  <button
+                                    onClick={() => onEditProduct(p)}
+                                    className={`p-1 rounded border cursor-pointer transition-all ${
+                                      isLight
+                                        ? 'bg-blue-50 text-blue-700 hover:bg-blue-100 border-blue-200'
+                                        : 'bg-blue-600/30 text-cyan-300 hover:bg-blue-600/50 border-blue-500/30'
+                                    }`}
+                                    title="تعديل"
+                                  >
+                                    <Edit3 className="w-3.5 h-3.5" />
+                                  </button>
+                                  <button
+                                    onClick={() => handleDeleteProduct(p.id)}
+                                    className={`p-1 rounded border cursor-pointer transition-all ${
+                                      isLight
+                                        ? 'bg-rose-50 text-rose-700 hover:bg-rose-100 border-rose-200'
+                                        : 'bg-rose-500/20 text-rose-400 hover:bg-rose-500/30 border-rose-500/30'
+                                    }`}
+                                    title="حذف"
+                                  >
+                                    <Trash2 className="w-3.5 h-3.5" />
+                                  </button>
+                                </>
+                              )}
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          ) : (
+            /* Simplified Compact Grid View */
+            <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-2.5 sm:gap-3">
+              {paginatedProducts.map((p) => {
+                const numUnits = Math.max(1, p.unitsPerCarton || 1);
+                const cartonCost = p.cartonPurchasePrice || (p.cost * numUnits);
+                const unitCost = p.costPerUnit || (cartonCost / numUnits);
+                const singleSell = p.singleRetailPrice || p.price;
+                const cartonSell = p.cartonSellingPrice || (p.price * numUnits * 0.95);
+                const singleProfitVal = p.singleProfit !== undefined ? p.singleProfit : (singleSell - unitCost);
+
+                return (
+                  <div 
+                    key={p.id} 
+                    className={`p-2.5 rounded-xl border flex flex-col justify-between transition-all duration-200 hover:shadow-md hover:scale-[1.01] ${
+                      isLight
+                        ? 'bg-white border-slate-200 shadow-sm text-slate-800'
+                        : 'bg-[#0F172A] border-slate-800 hover:border-cyan-500/40 text-white'
+                    }`}
+                  >
+                    {/* Header: Name and Barcode */}
+                    <div className="space-y-1">
+                      <div className="flex items-center justify-between gap-1">
+                        <span className={`text-[10px] font-mono px-1.5 py-0.5 rounded font-bold truncate max-w-[110px] ${
+                          isLight ? 'bg-slate-100 text-slate-700' : 'bg-slate-800 text-cyan-300'
+                        }`}>
+                          {p.barcode || '—'}
+                        </span>
+                        <span className={`text-[10px] font-mono px-1.5 py-0.2 rounded font-bold ${
+                          p.stock <= 0
+                            ? 'bg-rose-500/20 text-rose-400 border border-rose-500/30'
+                            : p.stock <= p.minStock
+                            ? 'bg-amber-500/20 text-amber-400 border border-amber-500/30'
+                            : isLight
+                            ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                            : 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
+                        }`}>
+                          {p.stock}
+                        </span>
+                      </div>
+
+                      {/* Prominent Product Name */}
+                      <h4 
+                        className={`text-xs font-black line-clamp-2 leading-snug pt-0.5 ${
+                          isLight ? 'text-slate-900' : 'text-slate-100'
+                        }`}
+                        title={p.nameAr || p.name}
+                      >
+                        {p.nameAr || p.name}
+                      </h4>
+                    </div>
+
+                    {/* Pricing info */}
+                    <div className={`mt-2 pt-1.5 border-t space-y-0.5 ${
+                      isLight ? 'border-slate-100' : 'border-slate-800/80'
+                    }`}>
+                      <div className="flex items-center justify-between text-[11px]">
+                        <span className={`text-[10px] ${isLight ? 'text-slate-500' : 'text-slate-400'}`}>
+                          {t('مفرد:', 'تاک:', 'Single:')}
+                        </span>
+                        <span className={`font-black font-mono ${
+                          isLight ? 'text-emerald-700' : 'text-emerald-400'
+                        }`}>
+                          {settings.currencySymbol}{formatNumber(singleSell)}
+                        </span>
+                      </div>
+
+                      <div className="flex items-center justify-between text-[10px]">
+                        <span className={isLight ? 'text-slate-500' : 'text-slate-400'}>
+                          {t('كرتون:', 'کارتۆن:', 'Carton:')}
+                        </span>
+                        <span className={`font-bold font-mono ${
+                          isLight ? 'text-blue-700' : 'text-cyan-300'
+                        }`}>
+                          {settings.currencySymbol}{formatNumber(cartonSell)}
+                        </span>
+                      </div>
+
+                      {canViewPurchasePrice && (
+                        <div className="flex items-center justify-between text-[9.5px] pt-0.5">
+                          <span className={isLight ? 'text-slate-400' : 'text-slate-500'}>
+                            {t('ربح:', 'قازانج:', 'Profit:')}
+                          </span>
+                          <span className={`font-mono font-bold ${
+                            singleProfitVal < 0 
+                              ? 'text-rose-400' 
+                              : isLight ? 'text-emerald-600' : 'text-emerald-400'
+                          }`}>
+                            {singleProfitVal >= 0 ? '+' : ''}{settings.currencySymbol}{formatNumber(singleProfitVal)}
+                          </span>
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Action buttons */}
+                    <div className="flex items-center gap-1 mt-2 pt-1.5 border-t border-slate-100 dark:border-slate-800/60">
+                      {onOpenPrintBarcode && (
+                        <button
+                          type="button"
+                          onClick={() => onOpenPrintBarcode(p)}
+                          className={`p-1.5 rounded-lg border font-bold text-xs flex items-center justify-center transition-all cursor-pointer ${
+                            canEditProducts ? 'w-8 shrink-0' : 'flex-1'
+                          } ${
+                            isLight
+                              ? 'bg-amber-50 hover:bg-amber-100 text-amber-800 border-amber-200'
+                              : 'bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 border-amber-500/30'
+                          }`}
+                          title="طباعة ملصق السعر والباركود"
+                        >
+                          <Printer className="w-3.5 h-3.5" />
+                          {!canEditProducts && <span className="text-[10px] mr-1">طباعة ملصق</span>}
+                        </button>
+                      )}
+
+                      {canEditProducts && (
+                        <button
+                          onClick={() => onEditProduct(p)}
+                          className="flex-1 py-1 rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-bold text-[11px] flex items-center justify-center gap-1 transition-all cursor-pointer shadow-sm"
+                        >
+                          <Edit3 className="w-3 h-3" />
+                          <span>تعديل</span>
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          {renderPagination()}
+        </div>
+      )}
+
+      {/* View 2: Stock Status & Remaining/Out of Stock View (المواد المتبقية والنافذة) */}
+      {activeSubView === 'stockStatus' && (
+        <div className="space-y-4 animate-fadeIn">
+          {/* 5 KPI Metric Cards */}
+          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2.5 sm:gap-3">
+            {/* Total Items */}
+            <div className={`p-3 sm:p-4 rounded-2xl border transition-all ${
+              isLight ? 'bg-white border-slate-200 shadow-sm' : 'bg-[#0B1120] border-blue-500/20'
+            }`}>
+              <div className="flex items-center justify-between">
+                <span className={`text-xs font-bold ${isLight ? 'text-slate-600' : 'text-slate-400'}`}>{t('إجمالي المواد', 'کۆی گشتی کاڵاکان', 'Total Items')}</span>
+                <Package className={`w-4 h-4 ${isLight ? 'text-blue-600' : 'text-blue-400'}`} />
+              </div>
+              <p className={`text-lg sm:text-2xl font-black mt-1 font-mono ${isLight ? 'text-slate-900' : 'text-white'}`}>{totalProductsCount}</p>
+              <span className={`text-[10px] ${isLight ? 'text-slate-500' : 'text-slate-500'}`}>{t('جميع المواد بالمخزن', 'هەموو کاڵاکانی کۆگا', 'All catalog items')}</span>
+            </div>
+
+            {/* In Stock */}
+            <div className={`p-3 sm:p-4 rounded-2xl border transition-all ${
+              isLight ? 'bg-white border-emerald-200 shadow-sm' : 'bg-[#0B1120] border-emerald-500/30 shadow-[0_0_15px_rgba(16,185,129,0.1)]'
+            }`}>
+              <div className="flex items-center justify-between">
+                <span className={`text-xs font-bold ${isLight ? 'text-emerald-700' : 'text-emerald-400'}`}>{t('مواد متوفرة', 'کاڵای بەردەست', 'In Stock')}</span>
+                <CheckCircle2 className={`w-4 h-4 ${isLight ? 'text-emerald-600' : 'text-emerald-400'}`} />
+              </div>
+              <p className={`text-lg sm:text-2xl font-black mt-1 font-mono ${isLight ? 'text-emerald-700' : 'text-emerald-300'}`}>{inStockCount}</p>
+              <span className={`text-[10px] ${isLight ? 'text-emerald-600' : 'text-emerald-500/80'}`}>{t('كمية آمنة فوق الحد الأدنى', 'بڕی پێویست لە سەرووی کەمترینە', 'Safe stock quantity')}</span>
+            </div>
+
+            {/* Low Stock */}
+            <div className={`p-3 sm:p-4 rounded-2xl border transition-all ${
+              isLight ? 'bg-white border-amber-200 shadow-sm' : 'bg-[#0B1120] border-amber-500/30 shadow-[0_0_15px_rgba(245,158,11,0.1)]'
+            }`}>
+              <div className="flex items-center justify-between">
+                <span className={`text-xs font-bold ${isLight ? 'text-amber-700' : 'text-amber-400'}`}>{t('قارب على النفاد', 'کەمبووەتەوە', 'Low Stock')}</span>
+                <AlertTriangle className={`w-4 h-4 ${isLight ? 'text-amber-600' : 'text-amber-400'}`} />
+              </div>
+              <p className={`text-lg sm:text-2xl font-black mt-1 font-mono ${isLight ? 'text-amber-700' : 'text-amber-300'}`}>{lowStockProducts.length}</p>
+              <span className={`text-[10px] ${isLight ? 'text-amber-600' : 'text-amber-500/80'}`}>{t('تحتاج إعادة طلب وتوريد', 'پێویستی بە داواکردنەوەیە', 'Needs reordering')}</span>
+            </div>
+
+            {/* Out of Stock */}
+            <div className={`p-3 sm:p-4 rounded-2xl border transition-all ${
+              isLight ? 'bg-white border-rose-200 shadow-sm' : 'bg-[#0B1120] border-rose-500/30 shadow-[0_0_15px_rgba(244,63,94,0.1)]'
+            }`}>
+              <div className="flex items-center justify-between">
+                <span className={`text-xs font-bold ${isLight ? 'text-rose-700' : 'text-rose-400'}`}>{t('مواد نفدت بالكامل', 'تەواوبوو / نەماوە', 'Out of Stock')}</span>
+                <Trash2 className={`w-4 h-4 ${isLight ? 'text-rose-600' : 'text-rose-400'}`} />
+              </div>
+              <p className={`text-lg sm:text-2xl font-black mt-1 font-mono ${isLight ? 'text-rose-700' : 'text-rose-300'}`}>{outOfStockProducts.length}</p>
+              <span className={`text-[10px] ${isLight ? 'text-rose-600' : 'text-rose-500/80'}`}>{t('الكمية الحالية 0 قطعة', 'بڕی ئێستا 0 دانەیە', '0 units available')}</span>
+            </div>
+
+            {/* Deficit / Negative */}
+            <div className={`p-3 sm:p-4 rounded-2xl border transition-all ${
+              isLight ? 'bg-white border-purple-200 shadow-sm' : 'bg-[#0B1120] border-purple-500/30'
+            }`}>
+              <div className="flex items-center justify-between">
+                <span className={`text-xs font-bold ${isLight ? 'text-purple-700' : 'text-purple-400'}`}>{t('سحب بالسالب / عجز', 'قەرزی کۆگا (سالب)', 'Stock Deficit')}</span>
+                <AlertTriangle className={`w-4 h-4 ${isLight ? 'text-purple-600' : 'text-purple-400'}`} />
+              </div>
+              <p className={`text-lg sm:text-2xl font-black mt-1 font-mono ${isLight ? 'text-purple-700' : 'text-purple-300'}`}>{debtStockProducts.length}</p>
+              <span className={`text-[10px] ${isLight ? 'text-purple-600' : 'text-purple-400/80'}`}>{t('مبيعات على المكشوف', 'فرۆشتنی سەربەست', 'Negative stock count')}</span>
+            </div>
+          </div>
+
+          {/* Stock Tracking Table */}
+          <div className={`rounded-2xl border overflow-hidden shadow-lg transition-all ${
+            isLight ? 'bg-white border-slate-200 shadow-sm' : 'cyber-card border-blue-500/20'
+          }`}>
+            <div className={`p-3 border-b flex items-center justify-between flex-wrap gap-2 transition-colors ${
+              isLight ? 'bg-slate-100/90 border-slate-200' : 'bg-[#0B1120] border-slate-800'
+            }`}>
+              <div className="flex items-center gap-2">
+                <Package className={`w-4 h-4 ${isLight ? 'text-amber-600' : 'text-amber-400'}`} />
+                <span className={`text-xs sm:text-sm font-bold ${isLight ? 'text-slate-900' : 'text-white'}`}>
+                  {t('جدول تتبع الكميات المتبقية وحالة النفاذ', 'خشتەی بەدواداچوونی بڕی ماوە و دۆخی کۆگا', 'Inventory Remaining & Out-of-Stock Table')}
+                </span>
+              </div>
+            </div>
+
+            <div className="overflow-x-auto">
+              <table className="w-full text-left rtl:text-right text-[11px]">
+                <thead>
+                  <tr className={`border-b font-semibold uppercase text-[10px] whitespace-nowrap ${
+                    isLight
+                      ? 'border-slate-200 bg-slate-50 text-slate-700'
+                      : 'border-slate-800 text-slate-400 bg-[#0B1120]/90'
+                  }`}>
+                    <th className="py-2.5 px-3">{t('الباركود', 'بارکۆد', 'Barcode')}</th>
+                    <th className="py-2.5 px-3">{t('اسم المادة', 'ناوی کاڵا', 'Product Name')}</th>
+                    <th className="py-2.5 px-3">{t('المندوب / المورد', 'مەندوب / دابینکەر', 'Delegate / Supplier')}</th>
+                    <th className="py-2.5 px-3 text-center">{t('الكراتين والمحتوى', 'کارتۆن و دانەکان', 'Packaging')}</th>
+                    <th className="py-2.5 px-3 text-center">{t('الكمية المتبقية الحالية', 'بڕی ماوەی ئێستا', 'Current Remaining Units')}</th>
+                    <th className="py-2.5 px-3 text-center">{t('الحد الأدنى للطلب', 'کەمترین ڕێژە', 'Min Stock')}</th>
+                    <th className="py-2.5 px-3 text-center">{t('حالة المخزون', 'دۆخی کۆگا', 'Status')}</th>
+                  </tr>
+                </thead>
+                <tbody className={`divide-y whitespace-nowrap ${
+                  isLight ? 'divide-slate-200 text-slate-800' : 'divide-slate-800/60 text-slate-200'
+                }`}>
+                  {paginatedProducts.map((p) => {
+                    const numCartons = p.cartonsCount || 0;
+                    const numUnits = p.unitsPerCarton || 12;
+                    const totalUnits = p.totalUnits || p.stock || (numCartons * numUnits);
+                    const isLow = p.stock <= p.minStock && p.stock > 0;
+                    const isOut = p.stock === 0;
+                    const isDebt = p.stock < 0;
+
+                    return (
+                      <tr key={p.id} className={`transition-colors ${
+                        isDebt
+                          ? isLight ? 'bg-purple-50 hover:bg-purple-100/60' : 'bg-purple-950/20 hover:bg-purple-900/30'
+                          : isOut
+                            ? isLight ? 'bg-rose-50 hover:bg-rose-100/60' : 'bg-rose-950/10 hover:bg-slate-800/40'
+                            : isLow
+                              ? isLight ? 'bg-amber-50 hover:bg-amber-100/60' : 'bg-amber-950/10 hover:bg-slate-800/40'
+                              : isLight ? 'hover:bg-blue-50/40' : 'hover:bg-slate-800/40'
+                      }`}>
+                        {/* Barcode */}
+                        <td className={`py-2.5 px-3 font-mono font-bold ${
+                          isLight ? 'text-blue-700' : 'text-cyan-400'
+                        }`}>
+                          {p.barcode}
+                        </td>
+
+                        {/* Name */}
+                        <td className="py-2.5 px-3">
+                          <div className="flex items-center gap-2">
+                            <span className={`text-lg p-1 rounded ${
+                              isLight ? 'bg-slate-100' : 'bg-slate-800'
+                            }`}>{p.imageIcon || '📦'}</span>
+                            <div>
+                              <p className={`font-bold text-xs ${isLight ? 'text-slate-900' : 'text-white'}`}>{p.nameAr || p.name}</p>
+                              <span className={`text-[10px] ${isLight ? 'text-slate-500' : 'text-slate-400'}`}>{p.categoryAr || p.category}</span>
+                            </div>
+                          </div>
+                        </td>
+
+                        {/* Supplier */}
+                        <td className={`py-2.5 px-3 ${isLight ? 'text-slate-700' : 'text-slate-300'}`}>
+                          <span className="text-xs">{p.supplierDelegate || p.supplierName || 'عام'}</span>
+                          {p.batchNumber && (
+                            <span className={`text-[9px] font-mono block ${isLight ? 'text-amber-700' : 'text-amber-400'}`}>
+                              Batch: {p.batchNumber}
+                            </span>
+                          )}
+                        </td>
+
+                        {/* Packaging info */}
+                        <td className="py-2.5 px-3 text-center">
+                          <span className={`font-bold ${isLight ? 'text-slate-900' : 'text-slate-200'}`}>{numCartons} {t('كرتون', 'کارتۆن', 'ctn')}</span>
+                          <span className={`text-[10px] block ${isLight ? 'text-slate-500' : 'text-slate-500'}`}>({numUnits} {t('قطعة بالكرتون', 'دانە لە کارتۆن', 'pcs/ctn')})</span>
+                        </td>
+
+                        {/* Remaining Stock Units */}
+                        <td className="py-2.5 px-3 text-center">
+                          {isDebt ? (
+                            <span className={`px-3 py-1 rounded-xl font-black font-mono border text-xs animate-pulse inline-flex items-center gap-1 ${
+                              isLight
+                                ? 'bg-purple-100 border-purple-300 text-purple-900 shadow-sm'
+                                : 'bg-rose-950 text-rose-300 border-rose-500/60 shadow-[0_0_10px_rgba(244,63,94,0.4)]'
+                            }`}>
+                              <AlertTriangle className="w-3 h-3 text-purple-600 dark:text-rose-400" />
+                              {t(`عجز (${p.stock} قطعة)`, `قەرز (${p.stock} دانە)`, `Deficit (${p.stock} pcs)`)}
+                            </span>
+                          ) : isOut ? (
+                            <span className={`px-3 py-1 rounded-xl font-black font-mono border text-xs inline-flex items-center gap-1 shadow-sm ${
+                              isLight
+                                ? 'bg-rose-100 border-rose-300 text-rose-900'
+                                : 'bg-rose-900/60 text-rose-200 border-rose-500/50'
+                            }`}>
+                              <Trash2 className="w-3 h-3 text-rose-600 dark:text-rose-300" />
+                              {t('0 قطعة (نفد بالكامل)', '0 دانە (تەواوبوو)', '0 pcs (Out of Stock)')}
+                            </span>
+                          ) : isLow ? (
+                            <span className={`px-3 py-1 rounded-xl font-black font-mono border text-xs inline-flex items-center gap-1 ${
+                              isLight
+                                ? 'bg-amber-100 border-amber-300 text-amber-900'
+                                : 'bg-amber-950 text-amber-300 border-amber-500/50'
+                            }`}>
+                              <AlertTriangle className="w-3 h-3 text-amber-600 dark:text-amber-400" />
+                              {p.stock} {t('قطعة (منخفض)', 'دانە (کەمبووە)', 'pcs (Low)')}
+                            </span>
+                          ) : (
+                            <span className={`px-3 py-1 rounded-xl font-black font-mono border text-xs ${
+                              isLight
+                                ? 'bg-emerald-100 border-emerald-300 text-emerald-900'
+                                : 'bg-emerald-950 text-emerald-300 border-emerald-500/40'
+                            }`}>
+                              {p.stock} {t('قطعة متوفرة', 'دانەی بەردەست', 'pcs available')}
+                            </span>
+                          )}
+                        </td>
+
+                        {/* Min Stock */}
+                        <td className={`py-2.5 px-3 text-center font-mono font-bold ${
+                          isLight ? 'text-slate-800' : 'text-slate-300'
+                        }`}>
+                          {p.minStock} {t('قطعة', 'دانە', 'pcs')}
+                        </td>
+
+                        {/* Status Badge */}
+                        <td className="py-2.5 px-3 text-center">
+                          {isDebt ? (
+                            <span className={`px-2 py-0.5 rounded-md border text-[10px] font-bold ${
+                              isLight ? 'bg-purple-100 text-purple-800 border-purple-200' : 'bg-purple-500/20 text-purple-300 border-purple-500/30'
+                            }`}>
+                              {t('سالب / عجز', 'سالب / قەرز', 'Deficit')}
+                            </span>
+                          ) : isOut ? (
+                            <span className={`px-2 py-0.5 rounded-md border text-[10px] font-bold ${
+                              isLight ? 'bg-rose-100 text-rose-800 border-rose-200' : 'bg-rose-500/20 text-rose-400 border-rose-500/30'
+                            }`}>
+                              {t('نافد تماماً', 'تەواوبووە', 'Out of Stock')}
+                            </span>
+                          ) : isLow ? (
+                            <span className={`px-2 py-0.5 rounded-md border text-[10px] font-bold ${
+                              isLight ? 'bg-amber-100 text-amber-800 border-amber-200' : 'bg-amber-500/20 text-amber-400 border-amber-500/30'
+                            }`}>
+                              {t('قارب على النفاد', 'کەمبووەتەوە', 'Low Stock')}
+                            </span>
+                          ) : (
+                            <span className={`px-2 py-0.5 rounded-md border text-[10px] font-bold ${
+                              isLight ? 'bg-emerald-100 text-emerald-800 border-emerald-200' : 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30'
+                            }`}>
+                              {t('متوفر وآمن', 'بەردەستە', 'In Stock')}
+                            </span>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+          {renderPagination()}
+        </div>
+      )}
+      </>
+      )}
+
+    </div>
+  );
+};
+

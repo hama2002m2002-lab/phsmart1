@@ -1,0 +1,522 @@
+export type Language = 'ar' | 'en' | 'ku';
+
+export type Category = 
+  | 'Dairy & Milk'
+  | 'Beverages & Juices'
+  | 'Snacks & Sweets'
+  | 'Bakery & Bread'
+  | 'Meat & Poultry'
+  | 'Fresh Produce'
+  | 'Frozen Foods'
+  | 'Canned Goods'
+  | 'Household & Care';
+
+export interface ProductBatch {
+  id: string;
+  batchNumber?: string; // رقم التشغيلة أو الدفعة
+  expiryDate: string; // تاريخ انتهاء الصلاحية
+  productionDate?: string; // تاريخ الإنتاج
+  quantity: number; // الكمية المتبقية من هذا التاريخ
+  purchasePrice?: number; // سعر الشراء لهذه الدفعة
+  supplierName?: string; // المورد
+  addedDate?: string; // تاريخ الإدخال
+}
+
+export interface Product {
+  id: string;
+  name: string;
+  nameAr: string;
+  nameKu?: string;
+  category: Category | string;
+  categoryAr: string;
+  categoryKu?: string;
+  barcode: string;
+  sku?: string;
+  supplierDelegate?: string; // اسم المندوب
+  cartonsCount: number; // عدد الكراتين
+  unitsPerCarton: number; // عدد المواد داخل الكرتونة
+  totalUnits: number; // مجموع المواد كلها (عدد الكراتين * عدد المواد داخل الكرتونة)
+  cartonPurchasePrice: number; // سعر شراء كرتون واحد (آخر سعر شراء حقيقي)
+  lastPurchasePrice?: number; // آخر سعر شراء فعلي للمادة الواحدة
+  lastCartonPurchasePrice?: number; // آخر سعر شراء فعلي للكرتون
+  costPerUnit: number; // سعر تكلفة المادة الواحدة (المتوسط المرجح للتكلفة القديمة والجديدة للأرباح والتقارير)
+  singleRetailPrice: number; // سعر البيع مفرد
+  wholesalePrice: number; // سعر البيع بالجملة
+  cartonSellingPrice: number; // سعر البيع بالكرتون
+  singleProfit: number; // ارباح البيع المفرد (سعر البيع المفرد - سعر تكلفة القطعة)
+  wholesaleProfit: number; // ارباح البيع بالجملة (سعر البيع بالجملة - سعر تكلفة القطعة)
+  cartonProfit: number; // ارباح بيع الكرتون (سعر بيع الكرتون - سعر شراء الكرتون)
+  initialAddDate: string; // تاريخ أول إضافة مواد
+  lastEditDate: string; // تاريخ آخر تعديل مواد
+  lastPriceUpdate?: string; // تاريخ ووقت آخر تغيير بسعر المادة
+  priceHistory?: Array<{
+    date: string;
+    oldPrice: number;
+    newPrice: number;
+    oldCost?: number;
+    newCost?: number;
+    updatedBy?: string;
+  }>;
+  expiryDate: string; // تاريخ انتهاء صلاحية المواد (أقرب تاريخ انتهاء)
+  productionDate?: string;
+  batches?: ProductBatch[]; // دفعات وتواريخ انتهاء الصلاحية المتعددة
+  price: number; // standard single retail price for POS compatibility
+  cost: number; // standard cost per unit
+  stock: number; // total units in stock
+  minStock: number;
+  unit: string;
+  supplierId: string;
+  supplierName: string;
+  imageIcon: string;
+  status: 'in_stock' | 'low_stock' | 'out_of_stock';
+  
+  // 🏥 Pharmacy Specific Fields (البيانات الدوائية والصيدلانية)
+  scientificName?: string; // الاسم العلمي (Active Ingredient)
+  dosageForm?: string; // التركيز والشكل الدوائي (e.g. 500mg - أقراص)
+  countryOfOrigin?: string; // الدولة المصنعة للدواء
+  manufacturer?: string; // اسم الشركة المصنعة
+  pharmaCategory?: string; // الفئة والترميز (OTC / Rx / أدوية مراقبة / مستلزمات)
+  batchNumber?: string; // رقم التشغيلة (Batch/Lot No)
+  expiryAlertMonths?: number; // الأشهر المتبقية للتنبيه (Default 6)
+  blistersPerBox?: number; // عدد الأشرطة / التجزئة داخل العلبة
+  blisterPrice?: number; // سعر بيع الشريط / القطعة التجزئة
+  storageCondition?: string; // ظروف الحفظ (ثلاجة / حرارة الغرفة / بعيداً عن الضوء)
+  storageLocation?: string; // مكان التخزين والرف
+}
+
+export interface CashierAttendanceRecord {
+  id: string;
+  cashierId?: string;
+  cashierName: string;
+  date: string; // YYYY-MM-DD
+  checkInTime?: string; // HH:mm
+  checkOutTime?: string; // HH:mm
+  status: 'present' | 'absent' | 'late' | 'leave'; // حاضر / غائب / متأخر / إجازة
+  hoursWorked?: number;
+  notes?: string;
+  createdAt: string;
+}
+
+export type SaleUnitType = 'retail' | 'wholesale' | 'carton' | 'blister';
+
+export interface PrescriptionInfo {
+  doctorName?: string;
+  patientName?: string;
+  patientAge?: string;
+  patientPhone?: string;
+  prescriptionNotes?: string;
+}
+
+export interface CartItem {
+  product: Product;
+  quantity: number;
+  saleType: SaleUnitType;
+  addedAtTime?: string;
+  dosageInstruction?: string;
+}
+
+export interface ReturnedSaleItem {
+  productId: string;
+  productName: string;
+  productNameAr?: string;
+  productNameKu?: string;
+  price: number;
+  quantity: number;
+  saleType?: SaleUnitType;
+  total: number;
+  returnedAt: string;
+}
+
+export interface SaleTransaction {
+  id: string;
+  invoiceNumber: string;
+  timestamp: string;
+  customerName?: string;
+  customerId?: string;
+  debtAmount?: number;
+  paidAmount?: number;
+  prescriptionInfo?: PrescriptionInfo;
+  items: {
+    productId: string;
+    productName: string;
+    productNameAr: string;
+    productNameKu?: string;
+    barcode?: string;
+    price: number;
+    quantity: number;
+    saleType?: SaleUnitType;
+    total: number;
+    addedAtTime?: string;
+    dosageInstruction?: string;
+  }[];
+  returnedItems?: ReturnedSaleItem[];
+  subtotal: number;
+  tax: number;
+  discount: number;
+  total: number;
+  paymentMethod: 'cash' | 'card' | 'nfc' | 'debt' | 'loyalty';
+  amountTendered?: number;
+  changeDue?: number;
+  cashierName: string;
+  status: 'completed' | 'refunded' | 'pending';
+  notes?: string;
+}
+
+export interface SupplierPayment {
+  id: string;
+  date: string;
+  amount: number;
+  paymentMethod: 'cash' | 'transfer' | 'check';
+  note?: string;
+  invoiceNo?: string;
+}
+
+export interface Supplier {
+  id: string;
+  name: string;
+  nameAr: string;
+  nameKu?: string;
+  contactPerson: string;
+  phone: string;
+  email: string;
+  categorySupplied: string;
+  activeOrders: number;
+  totalInvoiced?: number; // إجمالي قيمة الشحنات والتوريدات
+  totalInvoicesCount?: number;
+  totalPaid?: number;     // إجمالي المبلغ المدفوع
+  balanceDue: number;     // الباقي / المتبقي
+  rating: number;
+  avatar: string;
+  taxNumber?: string;
+  address?: string;
+  isSaved?: boolean;      // الشركات المحفوظة / المفضلة
+  lastSupplyDate?: string; // تاريخ آخر توريد
+  payments?: SupplierPayment[];
+}
+
+export interface CustomerDebtSettlement {
+  id: string;
+  date: string;
+  amount: number;
+  paymentMethod: 'cash' | 'card' | 'transfer';
+  invoiceNumber?: string;
+  notes?: string;
+  cashierName?: string;
+}
+
+export interface Customer {
+  id: string;
+  name: string;
+  phone: string;
+  email: string;
+  loyaltyPoints: number;
+  totalSpent: number;
+  visitsCount: number;
+  tier: 'Bronze' | 'Silver' | 'Gold' | 'VIP';
+  joinedDate: string;
+  debtBalance?: number;        // إجمالي رصيد الدين المستحق على العميل
+  debtLimit?: number;          // الحد الأقصى للدين المسموح به
+  notes?: string;              // ملاحظات العميل
+  settlements?: CustomerDebtSettlement[]; // سجل دفعات وسداد الديون
+}
+
+export interface MarketOrder {
+  id: string;
+  orderNumber: string;
+  type: 'supplier_restock' | 'customer_delivery';
+  partyName: string;
+  date: string;
+  time: string;
+  itemsCount: number;
+  totalAmount: number;
+  status: 'pending' | 'in_transit' | 'delivered' | 'cancelled';
+  venueOrAddress: string;
+}
+
+export interface MarketNotification {
+  id: string;
+  title: string;
+  titleAr: string;
+  titleKu?: string;
+  message: string;
+  messageAr: string;
+  messageKu?: string;
+  time: string;
+  priority: 'critical' | 'high' | 'medium' | 'low';
+  category: 'inventory' | 'sales' | 'system' | 'supplier';
+  read: boolean;
+}
+
+export interface POSKeyboardShortcuts {
+  newWindow: string;        // Default: 'F1'
+  openInventory: string;    // Default: 'F2'
+  toggleReturn?: string;    // Default: 'F3'
+  viewReceipts?: string;    // Default: 'F4' (زر وصلات البيع والوصولات السابقة)
+  cashPayment?: string;     // Default: 'F5'
+  debtPayment?: string;     // Default: 'F6'
+  cardPayment?: string;     // Default: 'F7'
+  clearCart: string;        // Default: 'F8'
+  completeSale: string;     // Default: 'F9'
+  printReceipt: string;     // Default: 'F10'
+  openCashDrawer?: string;  // Default: 'F11'
+  focusBarcode: string;     // Default: 'Space'
+  switchNextWindow: string; // Default: 'F6'
+  switchPrevWindow: string; // Default: 'F7'
+  closeActiveWindow: string; // Default: 'F10'
+}
+
+export interface CustomerDisplayItem {
+  id: string;
+  productId: string;
+  name: string;
+  nameAr?: string;
+  nameKu?: string;
+  scientificName?: string;
+  barcode: string;
+  quantity: number;
+  saleType: SaleUnitType;
+  unitPrice: number;
+  total: number;
+  originalPrice?: number;
+  discountPerUnit?: number;
+  dosageInstruction?: string;
+  imageIcon?: string;
+  isNewlyAdded?: boolean;
+}
+
+export interface CustomerDisplayPayload {
+  activeWindowId: string;
+  windowIndex?: number;
+  items: CustomerDisplayItem[];
+  itemCount: number;
+  totalUnitsCount: number;
+  subtotal: number;
+  discountAmount: number;
+  tax: number;
+  total: number;
+  paymentMethod: 'cash' | 'card' | 'nfc' | 'debt';
+  cashTendered: number;
+  changeDue: number;
+  isReturnMode: boolean;
+  storeName: string;
+  storeNameAr?: string;
+  storeNameKu?: string;
+  currencySymbol: string;
+  phone?: string;
+  address?: string;
+  welcomeMessageAr?: string;
+  welcomeMessageKu?: string;
+  welcomeMessageEn?: string;
+  completedSale?: {
+    invoiceNumber: string;
+    total: number;
+    amountTendered?: number;
+    changeDue?: number;
+    paymentMethod: string;
+    itemsCount: number;
+    timestamp: string;
+  } | null;
+  cashierName?: string;
+  lastUpdated: number;
+}
+
+export interface StoreSettings {
+  storeName: string;
+  storeNameAr: string;
+  storeNameKu?: string;
+  taxRate: number; // e.g. 15 for 15%
+  currency: string;
+  currencySymbol: string;
+  phone: string;
+  address: string;
+  receiptHeaderMsg: string;
+  receiptFooterMsg: string;
+  autoPrintReceipt: boolean;
+  lowStockThresholdDefault: number;
+  language: Language;
+  themeMode?: 'dark' | 'light';
+  printerType?: 'thermal80mm' | 'thermal58mm' | 'a4' | 'a5' | 'label_barcode' | 'network' | 'browser';
+  connectedPrinterName?: string;
+  printerConnectionType?: 'system' | 'usb' | 'network' | 'bluetooth';
+  printerIpAddress?: string;
+  labelPrinterName?: string;
+  paperSize?: '80mm' | '58mm' | 'A4' | 'A5' | '50x30mm' | '40x20mm' | 'a4';
+  cashierPaperSize?: '80mm' | '58mm';
+  receiptShowItemBarcodes?: boolean;
+  receiptShowInvoiceBarcode?: boolean;
+  receiptBarcodeType?: 'code128' | 'qrcode' | 'both';
+  autoPrintPriceLabels?: boolean;
+  printerCopies?: number;
+  posShortcuts?: POSKeyboardShortcuts;
+  geminiApiKey?: string;
+  // Automated Scheduled Backup Configuration
+  autoBackupEnabled?: boolean;
+  autoBackupFrequency?: 'hourly' | 'daily' | 'disabled';
+  autoBackupDestination?: 'local_archive' | 'auto_download' | 'both';
+  lastAutoBackupTime?: string;
+  keepBackupHistoryCount?: number;
+}
+
+export interface AutoBackupSnapshot {
+  id: string;
+  timestamp: string; // ISO string
+  formattedDate: string;
+  triggerType: 'hourly' | 'daily' | 'manual';
+  itemsCount: {
+    products: number;
+    sales: number;
+    purchases: number;
+    customers: number;
+    suppliers: number;
+    invoices?: number;
+    audits?: number;
+  };
+  totalRecords: number;
+  sizeBytes: number;
+  dataJson?: string;
+}
+
+export interface UserPermissions {
+  canAccessDashboard?: boolean;
+  canAccessPOS: boolean;
+  canManageProducts: boolean;
+  canViewWarehouse?: boolean; // السماح للكاشير باستعراض وتصفح المخزن والمواد المتبقية والأسعار (بدون كلفة أو تعديل)
+  canManageInventoryAudit?: boolean;
+  canManagePurchases?: boolean;
+  canManageSuppliers: boolean;
+  canManageCustomers: boolean;
+  canManageOrders: boolean;
+  canViewInvoices?: boolean;
+  canViewAnalytics?: boolean;
+  canViewReports: boolean;
+  canManageSettings: boolean;
+  canViewPurchasePriceInPOS?: boolean; // إظهار سعر الشراء والتكلفة في واجهة الكاشير وسلة البيع
+}
+
+export interface UserAccount {
+  id: string;
+  fullName: string;
+  email: string;
+  username: string;
+  password?: string;
+  pinCode?: string;
+  role: 'Admin' | 'Manager' | 'Cashier';
+  active: boolean;
+  createdAt: string;
+  phone?: string;
+  address?: string;
+  bio?: string;
+  gender?: string;
+  specialization?: string; // التخصص أو المسمى الوظيفي
+  nationalIdFile?: string;
+  avatar?: string;
+  permissions: UserPermissions;
+}
+
+export interface PurchaseInvoiceItem {
+  id: string;
+  productId: string;
+  productName: string;
+  productNameAr: string;
+  barcode: string;
+  imageIcon: string;
+  categoryAr?: string;
+  currentStockInWarehouse: number; // الكمية المتوفرة بالمخزن حالياً (قديم)
+  purchasedQuantity: number; // عدد المواد التي تم شرائها حديثاً
+  oldPurchasePrice: number; // سعر الشراء القديم
+  newPurchasePrice: number; // سعر الشراء الجديد
+  oldRetailPrice: number; // سعر البيع القديم
+  newRetailPrice: number; // سعر البيع الجديد
+  unitsPerCarton?: number;
+  discountAmount?: number; // قيمة الخصم على المادة إن وجد
+  discountPercent?: number; // نسبة الخصم
+  totalCost?: number; // إجمالي تكلفة الشراء للسطر
+  expiryDate?: string; // تاريخ انتهاء صلاحية الدفعة الجديدة المشتراة
+  productionDate?: string; // تاريخ إنتاج الدفعة الجديدة
+  batchNumber?: string; // رقم التشغيلة / الدفعة
+  oldExpiryDate?: string; // تاريخ الصلاحية للكمية القديمة في المخزن
+}
+
+export interface PurchaseInvoice {
+  id: string;
+  invoiceNumber: string;
+  date: string;
+  time: string;
+  supplierName: string;
+  supplierPhone: string;
+  paymentType: 'cash' | 'credit' | 'part'; // نقداً / آجل / جزئي
+  paidAmount: number;
+  remainingAmount: number;
+  grossInvoiceAmount?: number; // إجمالي الفاتورة قبل الخصم
+  discountAmount?: number; // إجمالي الخصم
+  discountPercent?: number; // نسبة الخصم
+  totalInvoiceAmount: number;
+  items: PurchaseInvoiceItem[];
+  status: 'completed' | 'draft';
+  notes?: string;
+}
+
+export interface OperatingExpenseItem {
+  id: string;
+  name: string;
+  category: string;
+  categoryName?: string;
+  amount: number;
+  note?: string;
+  date?: string;
+  createdBy?: string;
+}
+
+export interface ExpenseCategory {
+  id: string;
+  name: string;
+  nameAr: string;
+  nameKu?: string;
+  nameEn?: string;
+  icon?: string;
+  isCustom?: boolean;
+}
+
+export interface InventoryAuditItem {
+  productId: string;
+  productName: string;
+  barcode: string;
+  unitsPerCarton: number;
+  systemUnits: number;
+  systemCartons: number;
+  marketUnits: number;
+  warehouseUnits: number;
+  actualUnits: number;
+  actualCartons: number;
+  diffUnits: number;
+  diffCartons: number;
+  unitCost: number;
+  unitPrice: number;
+  financialVariance: number;
+  status: 'match' | 'deficit' | 'surplus';
+}
+
+export interface InventoryAuditSession {
+  id: string;
+  sessionNumber: string;
+  timestamp: string;
+  date: string;
+  time: string;
+  auditorName: string;
+  totalProductsAudited: number;
+  matchedCount: number;
+  discrepancyCount: number;
+  deficitCount: number;
+  surplusCount: number;
+  totalSystemUnits: number;
+  totalActualUnits: number;
+  totalSystemCartons: number;
+  totalActualCartons: number;
+  netUnitVariance: number;
+  netCartonVariance: number;
+  totalFinancialVariance: number;
+  items: InventoryAuditItem[];
+  notes?: string;
+}
+
+

@@ -1,0 +1,310 @@
+import React, { useState, useEffect } from 'react';
+import { FileText, RotateCcw, Vault, Printer, LogOut, Globe, Home, Sun, Moon, Menu, X, Tv, Zap, WifiOff, Receipt } from 'lucide-react';
+import { StoreSettings, UserAccount, Language } from '../types';
+import { getTranslation } from '../lib/translations';
+
+interface HeaderProps {
+  activeTopTab: 'overview' | 'analytics' | 'reports' | 'notifications';
+  setActiveTopTab: (tab: 'overview' | 'analytics' | 'reports' | 'notifications') => void;
+  unreadNotifsCount: number;
+  settings: StoreSettings;
+  setSettings: React.Dispatch<React.SetStateAction<StoreSettings>>;
+  onQuickPOS?: () => void;
+  searchQuery: string;
+  setSearchQuery: (query: string) => void;
+  currentUser: UserAccount | null;
+  onLogout: () => void;
+  isPOSMode?: boolean;
+  onExitPOS?: () => void;
+  onShowInventory?: () => void;
+  inventoryCount?: number;
+  onOpenInventoryAudit?: () => void;
+  onOpenCompletedReceipts?: () => void;
+  onOpenSalesReturn?: () => void;
+  onOpenCashDrawer?: () => void;
+  onOpenShiftReport?: () => void;
+  onOpenCustomerDisplay?: () => void;
+  onOpenMobileSync?: () => void;
+  onOpenDesktopApp?: () => void;
+  onOpenCSharpCode?: () => void;
+  onOpenAccountsModal?: () => void;
+  onOpenLocalDataNetwork?: () => void;
+  isFirebaseSynced?: boolean;
+  onToggleSidebar?: () => void;
+  isSidebarOpen?: boolean;
+}
+
+export const Header: React.FC<HeaderProps> = ({
+  settings,
+  setSettings,
+  currentUser,
+  onLogout,
+  isPOSMode = false,
+  onExitPOS,
+  onOpenCompletedReceipts,
+  onOpenSalesReturn,
+  onOpenCashDrawer,
+  onOpenShiftReport,
+  onOpenCustomerDisplay,
+  onOpenLocalDataNetwork,
+  onToggleSidebar,
+  isSidebarOpen = false,
+}) => {
+  const lang = settings.language;
+  const isAr = lang === 'ar';
+  const isKu = lang === 'ku';
+
+  const cashierName = currentUser?.fullName || currentUser?.username || (isAr ? 'الكاشير الرئيسي' : isKu ? 'کاشێری سەرەکی' : 'Main Cashier');
+  const storeDisplayName = isKu ? (settings.storeNameKu || settings.storeNameAr || settings.storeName) : isAr ? (settings.storeNameAr || settings.storeName) : settings.storeName;
+
+  const [isOnline, setIsOnline] = useState(
+    typeof navigator !== 'undefined' ? navigator.onLine : true
+  );
+
+  useEffect(() => {
+    const handleOnline = () => setIsOnline(true);
+    const handleOffline = () => setIsOnline(false);
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+    return () => {
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
+    };
+  }, []);
+
+  const handleLanguageChange = (newLang: Language) => {
+    setSettings(prev => ({
+      ...prev,
+      language: newLang
+    }));
+  };
+
+  return (
+    <header className="sticky top-0 z-40 bg-[#0B1120]/95 backdrop-blur-md border-b border-blue-500/20 px-2 sm:px-4 lg:px-6 py-2 transition-all select-none">
+      <div className="flex items-center justify-between gap-1.5 sm:gap-2 max-w-full">
+        
+        {/* Left: Mobile Menu Toggle + Store Brand & Active Cashier */}
+        <div className="flex items-center space-x-1.5 sm:space-x-3 rtl:space-x-reverse min-w-0">
+          {/* Mobile Hamburger Button */}
+          {!isPOSMode && onToggleSidebar && (
+            <button
+              type="button"
+              onClick={onToggleSidebar}
+              className="lg:hidden w-9 h-9 flex items-center justify-center rounded-xl bg-slate-800/90 border border-slate-700 text-cyan-400 hover:text-white hover:bg-slate-700 active:scale-95 transition-all cursor-pointer shrink-0 shadow-sm"
+              title={isSidebarOpen ? 'إغلاق القائمة' : 'فتح القائمة الجانبية'}
+              aria-label="Toggle Navigation Menu"
+            >
+              {isSidebarOpen ? <X className="w-5 h-5" /> : <Menu className="w-5 h-5" />}
+            </button>
+          )}
+
+          <div className="w-8 h-8 sm:w-9 sm:h-9 rounded-xl bg-gradient-to-tr from-cyan-600 via-blue-600 to-indigo-600 flex items-center justify-center text-white font-black text-xs sm:text-sm shadow-[0_0_15px_rgba(6,182,212,0.35)] border border-cyan-400/30 shrink-0">
+            {cashierName.charAt(0)}
+          </div>
+          <div className="min-w-0 flex flex-col justify-center">
+            <div className="flex items-center gap-1 min-w-0">
+              <span className="text-amber-400 font-bold text-[10px] sm:text-xs shrink-0">
+                {isAr ? 'الكاشير:' : isKu ? 'کاشێر:' : 'Cashier:'}
+              </span>
+              <h1 className="text-xs sm:text-sm font-black text-slate-100 tracking-wide truncate max-w-[95px] xs:max-w-[130px] sm:max-w-[200px]">
+                {cashierName}
+              </h1>
+              {currentUser?.role && (
+                <span className="hidden sm:inline-block text-[9px] px-1.5 py-0.5 rounded-md bg-cyan-950/90 text-cyan-300 border border-cyan-500/30 font-bold shrink-0">
+                  {currentUser.role === 'Admin' ? (isAr ? 'مدير' : 'Admin') : (isAr ? 'كاشير' : 'Cashier')}
+                </span>
+              )}
+            </div>
+            <p className="text-[9px] sm:text-[10px] font-semibold text-cyan-400/80 flex items-center gap-1 truncate mt-0.5">
+              <span className="font-bold text-slate-300 truncate max-w-[85px] xs:max-w-[120px] sm:max-w-[160px]">{storeDisplayName}</span>
+              <span className="hidden sm:inline">•</span>
+              <span className="hidden sm:inline">{isKu ? 'سیستەمی فرۆشتن' : isAr ? 'نظام إدارة المبيعات' : 'Sales System'}</span>
+            </p>
+          </div>
+        </div>
+
+        {/* Center/Right: Offline Turbo status, Language Switcher, Theme and POS buttons */}
+        <div className="flex items-center space-x-1 sm:space-x-2 rtl:space-x-reverse shrink-0">
+          
+          {/* Offline Turbo Engine Status Badge */}
+          <div 
+            className={`hidden sm:flex items-center gap-1 sm:gap-1.5 px-2 py-1 rounded-xl text-[10px] sm:text-xs font-mono font-bold border transition-all ${
+              !isOnline 
+                ? 'bg-emerald-950/70 border-emerald-500/40 text-emerald-300 shadow-[0_0_12px_rgba(16,185,129,0.25)]' 
+                : 'bg-cyan-950/60 border-cyan-500/30 text-cyan-300'
+            }`}
+            title={isAr ? 'البرنامج يعمل بدون إنترنت (أوفلاين) بسرعة فائقة 0ms ومحلياً بالكامل على هذا الجهاز' : isKu ? 'سیستەم بەبێ ئینتەرنێت و خێرا کار دەکات' : '100% Offline Standalone POS (0ms)'}
+          >
+            <Zap className={`w-3 h-3 sm:w-3.5 sm:h-3.5 ${!isOnline ? 'text-emerald-400 animate-pulse' : 'text-cyan-400'}`} />
+            <span>{!isOnline ? (isAr ? 'أوفلاين فائق السرعة' : isKu ? 'ئۆفلاین خێرا' : 'Offline Turbo') : (isAr ? 'محلي فائق السرعة' : isKu ? 'خێرای لۆکاڵ' : 'Local Turbo')}</span>
+          </div>
+
+          {/* Quick Language Switcher */}
+          <div className="flex items-center bg-[#10192D] border border-cyan-500/30 rounded-xl p-0.5 gap-0.5">
+            <Globe className="w-3.5 h-3.5 text-cyan-400 ml-1 mr-0.5 shrink-0 hidden md:inline" />
+            <button
+              type="button"
+              onClick={() => handleLanguageChange('ar')}
+              className={`px-1.5 sm:px-2.5 py-1 text-[10px] sm:text-xs font-bold rounded-lg transition-all cursor-pointer active:scale-95 ${
+                lang === 'ar'
+                  ? 'bg-gradient-to-r from-cyan-600 to-blue-600 text-white shadow-[0_0_10px_rgba(6,182,212,0.4)]'
+                  : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/60'
+              }`}
+              title="تغيير اللغة إلى العربية"
+            >
+              عربي
+            </button>
+            <button
+              type="button"
+              onClick={() => handleLanguageChange('ku')}
+              className={`px-1.5 sm:px-2.5 py-1 text-[10px] sm:text-xs font-bold rounded-lg transition-all cursor-pointer active:scale-95 ${
+                lang === 'ku'
+                  ? 'bg-gradient-to-r from-cyan-600 to-blue-600 text-white shadow-[0_0_10px_rgba(6,182,212,0.4)]'
+                  : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/60'
+              }`}
+              title="گۆڕینی زمان بۆ کوردی"
+            >
+              کوردی
+            </button>
+            <button
+              type="button"
+              onClick={() => handleLanguageChange('en')}
+              className={`px-1.5 sm:px-2 py-1 text-[10px] sm:text-xs font-bold rounded-lg transition-all cursor-pointer active:scale-95 ${
+                lang === 'en'
+                  ? 'bg-gradient-to-r from-cyan-600 to-blue-600 text-white shadow-[0_0_10px_rgba(6,182,212,0.4)]'
+                  : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/60'
+              }`}
+              title="Switch to English"
+            >
+              EN
+            </button>
+          </div>
+
+          {/* Theme Switcher Button (Day / Night Mode - وضع ليلي و نهار) */}
+          <div className="flex items-center bg-[#10192D] border border-cyan-500/30 rounded-xl p-0.5">
+            <button
+              type="button"
+              onClick={() =>
+                setSettings(prev => ({
+                  ...prev,
+                  themeMode: prev.themeMode === 'light' ? 'dark' : 'light'
+                }))
+              }
+              className={`px-1.5 sm:px-2.5 py-1 rounded-lg text-[10px] sm:text-xs font-bold transition-all flex items-center gap-1 cursor-pointer active:scale-95 ${
+                settings.themeMode === 'light'
+                  ? 'bg-gradient-to-r from-amber-500 to-orange-500 text-white shadow-[0_0_10px_rgba(245,158,11,0.4)]'
+                  : 'bg-gradient-to-r from-indigo-600 to-blue-600 text-white shadow-[0_0_10px_rgba(99,102,241,0.4)]'
+              }`}
+              title={
+                settings.themeMode === 'light'
+                  ? (isAr ? 'التحويل إلى الوضع الليلي (الداكن)' : isKu ? 'دۆخی تاریک' : 'Switch to Dark Mode')
+                  : (isAr ? 'التحويل إلى الوضع النهاري (الفاتح)' : isKu ? 'دۆخی ڕووناک' : 'Switch to Light Mode')
+              }
+            >
+              {settings.themeMode === 'light' ? (
+                <>
+                  <Sun className="w-3.5 h-3.5 text-amber-100 shrink-0" />
+                  <span className="hidden md:inline">{isAr ? 'نهاري' : isKu ? 'ڕۆژ' : 'Day'}</span>
+                </>
+              ) : (
+                <>
+                  <Moon className="w-3.5 h-3.5 text-indigo-200 shrink-0" />
+                  <span className="hidden md:inline">{isAr ? 'ليلي' : isKu ? 'شەو' : 'Night'}</span>
+                </>
+              )}
+            </button>
+          </div>
+
+          {/* Right: Actions when in POS mode */}
+          {isPOSMode && (
+            <div className="flex items-center space-x-1 sm:space-x-1.5 rtl:space-x-reverse overflow-x-auto custom-scrollbar py-0.5">
+              {/* زر وصلات البيع (وصلات / الفواتير السابقة) */}
+              {onOpenCompletedReceipts && (
+                <button
+                  type="button"
+                  onClick={onOpenCompletedReceipts}
+                  className="flex items-center gap-1.5 px-2.5 sm:px-3.5 py-1.5 rounded-xl bg-gradient-to-r from-purple-600 via-indigo-600 to-blue-600 hover:brightness-110 text-white text-[11px] sm:text-xs font-black transition-all shadow-[0_0_18px_rgba(147,51,234,0.4)] border border-purple-400/50 active:scale-95 cursor-pointer shrink-0"
+                  title={isAr ? 'عرض وبحث وصلات وفواتير البيع المكتملة وإعادة طباعتها (اختصار: F4)' : isKu ? 'بینینی پسوولەکانی فرۆشتن و چاپکردنەوە (F4)' : 'Sales Receipts & Invoices (F4)'}
+                >
+                  <Receipt className="w-3.5 h-3.5 text-purple-200 shrink-0" />
+                  <span className="inline">{isAr ? 'وصلات البيع' : isKu ? 'پسوولەکانی فرۆشتن' : 'Receipts'}</span>
+                  <span className="px-1.5 py-0.2 rounded bg-purple-950/90 text-purple-200 text-[10px] font-mono font-bold border border-purple-400/50">
+                    F4
+                  </span>
+                </button>
+              )}
+
+              {/* زر استرجاع المواد */}
+              {onOpenSalesReturn && (
+                <button
+                  type="button"
+                  onClick={onOpenSalesReturn}
+                  className="flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 rounded-xl bg-gradient-to-r from-rose-600 via-pink-600 to-rose-700 hover:brightness-110 text-white text-[11px] sm:text-xs font-bold transition-all shadow-[0_0_15px_rgba(244,63,94,0.35)] border border-rose-400/40 active:scale-95 cursor-pointer shrink-0"
+                  title={isAr ? 'استرجاع مواد مباعة بالباركود أو رقم الوصل (اختصار: F3)' : 'Sales Return (F3)'}
+                >
+                  <RotateCcw className="w-3.5 h-3.5 text-rose-100 shrink-0" />
+                  <span className="inline">{isAr ? 'إرجاع مواد' : isKu ? 'گەڕاندنەوە' : 'Return'}</span>
+                  <span className="px-1.5 py-0.2 rounded bg-rose-950/90 text-rose-200 text-[10px] font-mono font-bold border border-rose-400/50">
+                    F3
+                  </span>
+                </button>
+              )}
+
+              {/* زر الخزنة */}
+              {onOpenCashDrawer && (
+                <button
+                  type="button"
+                  onClick={onOpenCashDrawer}
+                  className="flex items-center gap-1.5 px-2 sm:px-2.5 py-1.5 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 hover:brightness-110 text-white text-[11px] sm:text-xs font-bold transition-all shadow-[0_0_15px_rgba(16,185,129,0.35)] border border-emerald-400/40 active:scale-95 cursor-pointer shrink-0"
+                  title={isAr ? 'حركة الخزنة والدرج النقدي (اختصار: F11)' : 'Cash Drawer (F11)'}
+                >
+                  <Vault className="w-3.5 h-3.5 text-emerald-200 shrink-0" />
+                  <span className="hidden sm:inline">{isAr ? 'الخزنة' : isKu ? 'سندوق' : 'Safe'}</span>
+                  <span className="px-1.5 py-0.2 rounded bg-emerald-950/90 text-emerald-200 text-[10px] font-mono font-bold border border-emerald-400/50">
+                    F11
+                  </span>
+                </button>
+              )}
+
+              {/* زر تقرير الوردية */}
+              {onOpenShiftReport && (
+                <button
+                  type="button"
+                  onClick={onOpenShiftReport}
+                  className="flex items-center gap-1.5 px-2 sm:px-2.5 py-1.5 rounded-xl bg-gradient-to-r from-amber-500 via-orange-600 to-amber-700 hover:brightness-110 text-white text-[11px] sm:text-xs font-bold transition-all shadow-[0_0_15px_rgba(245,158,11,0.35)] border border-amber-400/40 active:scale-95 cursor-pointer shrink-0"
+                  title={isAr ? 'طباعة تقرير ملخص وردية اليوم (اختصار: Alt+W)' : 'Shift Report (Alt+W)'}
+                >
+                  <Printer className="w-3.5 h-3.5 text-amber-100 shrink-0" />
+                  <span className="hidden md:inline">{isAr ? 'ملخص الوردية' : isKu ? 'ڕاپۆرت' : 'Report'}</span>
+                  <span className="px-1.5 py-0.2 rounded bg-amber-950/90 text-amber-200 text-[10px] font-mono font-bold border border-amber-400/50">
+                    Alt+W
+                  </span>
+                </button>
+              )}
+
+              {/* زر الرئيسية / الخروج */}
+              {onExitPOS && (
+                <button
+                  type="button"
+                  onClick={onExitPOS}
+                  className="flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 rounded-xl bg-gradient-to-r from-slate-900 to-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 text-[11px] sm:text-xs font-black transition-all shadow-sm shrink-0 cursor-pointer active:scale-95"
+                  title={isAr ? 'الخروج والعودة للواجهة الرئيسية (اختصار: Esc)' : isKu ? 'دەرچوون بۆ لاپەڕەی سەرەکی (Esc)' : 'Exit to Dashboard (Esc)'}
+                >
+                  <Home className="w-3.5 h-3.5 text-cyan-300 shrink-0" />
+                  <span className="inline">{isAr ? 'الرئيسية' : isKu ? 'سەرەکی' : 'Home'}</span>
+                  <span className="px-1.5 py-0.2 rounded bg-slate-950 text-slate-300 text-[10px] font-mono font-bold border border-slate-700">
+                    Esc
+                  </span>
+                </button>
+              )}
+            </div>
+          )}
+        </div>
+
+      </div>
+    </header>
+  );
+};
+
+
+
